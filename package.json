@@ -1,0 +1,17 @@
+{
+  "name": "fwcg-bot",
+  "version": "1.0.0",
+  "description": "FWC Goal football alert and group manager bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
