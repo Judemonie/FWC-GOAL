@@ -40,7 +40,6 @@ if (!WEBHOOK_URL) { console.error('Missing WEBHOOK_URL'); process.exit(1); }
 
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
-app.use(express.json());
 
 // ---------- State (in memory; persisted on milestones only) ----------
 let state = {
@@ -961,7 +960,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 const SECRET_PATH = '/tg/' + BOT_TOKEN.split(':')[1].slice(0, 16);
-app.use(SECRET_PATH, (req, res) => bot.webhookCallback(SECRET_PATH)(req, res));
+app.use(bot.webhookCallback(SECRET_PATH));
 
 (async () => {
   await loadState();
