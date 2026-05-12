@@ -896,6 +896,78 @@ bot.command('status', async (ctx) => {
   await ctx.reply(text);
 });
 
+// SIMULATION TEST COMMAND - admin only
+// Replays a finished match in fast-forward without touching real state or locking the group
+bot.command('test_match', async (ctx) => {
+  if (!await isAdmin(ctx)) return;
+  const args = ctx.message.text.split(' ').slice(1);
+  const groupId = ctx.chat.id;
+
+  // sample match data - real 2022 World Cup Final Argentina vs France
+  const sampleMatch = {
+    id: 'TEST_DEMO',
+    utcDate: new Date(Date.now() - 60000).toISOString(),
+    homeTeam: { id: 1, name: 'Argentina', shortName: 'Argentina', tla: 'ARG' },
+    awayTeam: { id: 2, name: 'France', shortName: 'France', tla: 'FRA' }
+  };
+  const sampleGoals = [
+    { minute: 23, scorer: { name: 'Lionel Messi' }, team: { id: 1 } },
+    { minute: 36, scorer: { name: 'Angel Di Maria' }, team: { id: 1 } },
+    { minute: 80, scorer: { name: 'Kylian Mbappe' }, team: { id: 2 } },
+    { minute: 81, scorer: { name: 'Kylian Mbappe' }, team: { id: 2 } },
+    { minute: 108, scorer: { name: 'Lionel Messi' }, team: { id: 1 } },
+    { minute: 118, scorer: { name: 'Kylian Mbappe' }, team: { id: 2 } }
+  ];
+
+  await ctx.reply('simulation starting (no group lock, no state writes)');
+
+  const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // kickoff
+  await delay(2000);
+  await bot.telegram.sendMessage(groupId,
+    teamName(sampleMatch.homeTeam) + ' vs ' + teamName(sampleMatch.awayTeam) + '\n' + pick(KICKOFF_LINES));
+
+  // goals (compressed timing)
+  let runningHome = 0, runningAway = 0;
+  for (let i = 0; i < sampleGoals.length; i++) {
+    const g = sampleGoals[i];
+    if (g.team.id === 1) runningHome++; else runningAway++;
+
+    // halftime check at minute 45+
+    if (g.minute > 45 && i > 0 && sampleGoals[i - 1].minute <= 45) {
+      await delay(3000);
+      await bot.telegram.sendMessage(groupId, pick(HT_LINES) + '\n' +
+        teamName(sampleMatch.homeTeam) + ' ' + runningHome + ' - ' + runningAway + ' ' + teamName(sampleMatch.awayTeam));
+      await delay(2000);
+      await bot.telegram.sendMessage(groupId, pick(SH_LINES));
+    }
+
+    await delay(3500);
+    const scoringTeam = g.team.id === 1 ? teamName(sampleMatch.homeTeam) : teamName(sampleMatch.awayTeam);
+    await bot.telegram.sendMessage(groupId,
+      pick(GOAL_OPENERS) + '\n' +
+      teamName(sampleMatch.homeTeam) + ' ' + runningHome + ' - ' + runningAway + ' ' + teamName(sampleMatch.awayTeam) + '\n' +
+      g.scorer.name + ' (' + scoringTeam + ') ' + g.minute + "'");
+  }
+
+  // fulltime
+  await delay(3000);
+  const home = [], away = [];
+  for (const g of sampleGoals) {
+    const line = g.scorer.name + ' ' + g.minute + "'";
+    if (g.team.id === 1) home.push(line); else away.push(line);
+  }
+  await bot.telegram.sendMessage(groupId,
+    pick(FT_LINES) + '\n' +
+    teamName(sampleMatch.homeTeam) + ' ' + runningHome + ' - ' + runningAway + ' ' + teamName(sampleMatch.awayTeam) + '\n\n' +
+    teamName(sampleMatch.homeTeam) + ': ' + home.join(', ') + '\n' +
+    teamName(sampleMatch.awayTeam) + ': ' + away.join(', '));
+
+  await delay(1500);
+  await ctx.reply('simulation done. no state was modified. no api calls used.');
+});
+
 async function showSettings(ctx) {
   const s = state.settings;
   const on = v => v ? 'on' : 'off';
