@@ -138,6 +138,11 @@ function scheduleSave() {
 // ---------- Helpers ----------
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 async function isAdmin(ctx) {
   if (!ctx.from || !ctx.chat) return false;
   if (ctx.from.id === OWNER_ID) return true;
@@ -306,6 +311,19 @@ async function setGroupLocked(chatId, locked) {
   } catch (err) { console.log('lock err:', err.message); return false; }
 }
 
+// ---------- Send + Pin helpers ----------
+async function sendHTML(chatId, text, opts) {
+  const o = Object.assign({ parse_mode: 'HTML', disable_web_page_preview: true }, opts || {});
+  return bot.telegram.sendMessage(chatId, text, o);
+}
+
+async function pinMessage(chatId, messageId, silent) {
+  try {
+    await bot.telegram.pinChatMessage(chatId, messageId, { disable_notification: !!silent });
+    return true;
+  } catch (err) { console.log('pin err:', err.message); return false; }
+}
+
 // ---------- Moderation ----------
 const SCAM_PATTERNS = [
   /free\s+airdrop/i,
@@ -403,30 +421,30 @@ async function handleOffense(ctx) {
 }
 
 // ---------- Message variants ----------
-const GOAL_OPENERS = ['GOAL', 'goal', 'GOAL ' + E.ball, E.ball + E.ball, 'in!', E.fire, E.party];
+const GOAL_OPENERS = ['GOAL ' + E.ball, 'GOOOAL ' + E.ball + E.ball, 'GOAL!! ' + E.fire, 'IN! ' + E.ball, 'GOAL ' + E.ball + E.fire];
 const KICKOFF_LINES = [
-  'we are underway',
-  'kickoff. chat locked till the break',
+  'we are underway. chat locked',
+  'kickoff! ball is rolling',
   'here we go',
   'underway. talk at half-time',
-  'ball is rolling'
+  'and we are off'
 ];
 const HT_LINES = [
   'half-time. chat is open',
-  'break time',
+  'break time. take a breather',
   'first half done. talk among yourselves',
-  'half-time whistle'
+  'half-time whistle. chat unlocked'
 ];
-const FT_LINES = ['full time', 'final whistle', 'thats it', 'all over'];
-const SH_LINES = ['second half. chat locked', 'back underway', 'they are back out'];
-const PREGOAL_LINES = ['score change detected', 'goal incoming', 'looks like a goal'];
+const FT_LINES = ['full time ' + E.party, 'final whistle ' + E.party, 'thats it. all over', 'match over'];
+const SH_LINES = ['second half. chat locked again', 'back underway', 'they are back out'];
+const PREGOAL_LINES = ['something happened... ' + E.ball, 'goal incoming ' + E.fire, 'score change detected'];
 
 // ---------- Formatting ----------
 function fmtMatchLine(m) {
   const h = m.homeTeam || {}, a = m.awayTeam || {};
   const t = new Date(m.utcDate);
   const time = String(t.getUTCHours()).padStart(2, '0') + ':' + String(t.getUTCMinutes()).padStart(2, '0');
-  return time + ' UTC  ' + teamFlag(h) + ' ' + teamName(h) + ' vs ' + teamName(a) + ' ' + teamFlag(a);
+  return '<b>' + time + ' UTC</b>  ' + teamFlag(h) + ' ' + esc(teamName(h)) + ' vs ' + esc(teamName(a)) + ' ' + teamFlag(a);
 }
 
 function fmtScoreObj(m) {
@@ -442,6 +460,10 @@ function fmtScore(m) {
 }
 
 function scoreLine(m) {
+  return esc(teamName(m.homeTeam)) + '  <b>' + fmtScore(m) + '</b>  ' + esc(teamName(m.awayTeam));
+}
+
+function scoreLinePlain(m) {
   return teamName(m.homeTeam) + ' ' + fmtScore(m) + ' ' + teamName(m.awayTeam);
 }
 
@@ -465,9 +487,12 @@ async function postDailySchedule() {
   state.schedulePostedFor = today;
   saveStateNow();
   if (!matches.length) return;
-  const lines = ['today'];
+  const lines = ['<b>' + E.ball + ' today on the pitch</b>', ''];
   for (const m of matches) lines.push(fmtMatchLine(m));
-  try { await bot.telegram.sendMessage(state.groupId, lines.join('\n')); } catch (e) {}
+  try {
+    const sent = await sendHTML(state.groupId, lines.join('\n'));
+    await pinMessage(state.groupId, sent.message_id, true); // silent pin
+  } catch (e) {}
 }
 
 async function ensurePollForMatch(m) {
@@ -502,8 +527,14 @@ async function announceKickoff(m) {
     try { await bot.telegram.stopPoll(state.groupId, rec.pollMsgId); } catch (e) {}
   }
   if (state.settings.autoLock) await setGroupLocked(state.groupId, true);
-  const text = teamName(m.homeTeam) + ' vs ' + teamName(m.awayTeam) + '\n' + pick(KICKOFF_LINES);
-  try { await bot.telegram.sendMessage(state.groupId, text); } catch (e) {}
+  const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
+  const text = '<b>' + E.lock + ' KICKOFF</b>\n\n' +
+    hf + ' <b>' + esc(teamName(m.homeTeam)) + '</b> vs <b>' + esc(teamName(m.awayTeam)) + '</b> ' + af + '\n' +
+    pick(KICKOFF_LINES);
+  try {
+    const sent = await sendHTML(state.groupId, text);
+    await pinMessage(state.groupId, sent.message_id, false); // loud pin
+  } catch (e) {}
   rec.kickoffSent = true;
   saveStateNow();
 }
@@ -513,8 +544,8 @@ async function announceHalftime(m) {
   const rec = state.trackedMatches[id];
   if (rec.halftimeSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
-  const text = pick(HT_LINES) + '\n' + scoreLine(m);
-  try { await bot.telegram.sendMessage(state.groupId, text); } catch (e) {}
+  const text = '<b>' + E.unlock + ' HALF-TIME</b>\n\n' + scoreLine(m) + '\n' + pick(HT_LINES);
+  try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.halftimeSent = true;
   saveStateNow();
 }
@@ -524,7 +555,8 @@ async function announceSecondHalf(m) {
   const rec = state.trackedMatches[id];
   if (rec.secondHalfSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, true);
-  try { await bot.telegram.sendMessage(state.groupId, pick(SH_LINES)); } catch (e) {}
+  const text = '<b>' + E.lock + ' SECOND HALF</b>\n' + pick(SH_LINES);
+  try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.secondHalfSent = true;
   saveStateNow();
 }
@@ -534,25 +566,33 @@ async function announceFulltime(m, detail) {
   const rec = state.trackedMatches[id];
   if (rec.fulltimeSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
-  const lines = [pick(FT_LINES), scoreLine(m)];
+  const lines = ['<b>' + E.unlock + ' FULL TIME ' + E.party + '</b>', '', scoreLine(m)];
   const goals = (detail && detail.goals) || m.goals || [];
   if (goals.length) {
     const home = [], away = [];
     for (const g of goals) {
       const who = (g.scorer && g.scorer.name) || '?';
       const min = (g.minute != null ? g.minute + "'" : '');
-      const line = who + (min ? ' ' + min : '');
+      const line = esc(who) + (min ? ' <i>' + min + '</i>' : '');
       const teamId = g.team && g.team.id;
       if (teamId === (m.homeTeam && m.homeTeam.id)) home.push(line);
       else if (teamId === (m.awayTeam && m.awayTeam.id)) away.push(line);
     }
     if (home.length || away.length) {
       lines.push('');
-      lines.push(teamName(m.homeTeam) + ': ' + (home.join(', ') || '-'));
-      lines.push(teamName(m.awayTeam) + ': ' + (away.join(', ') || '-'));
+      lines.push('<b>' + esc(teamName(m.homeTeam)) + '</b>');
+      lines.push(home.join(', ') || '-');
+      lines.push('');
+      lines.push('<b>' + esc(teamName(m.awayTeam)) + '</b>');
+      lines.push(away.join(', ') || '-');
     }
   }
-  try { await bot.telegram.sendMessage(state.groupId, lines.join('\n')); } catch (e) {}
+  lines.push('');
+  lines.push(pick(FT_LINES));
+  try {
+    const sent = await sendHTML(state.groupId, lines.join('\n'));
+    await pinMessage(state.groupId, sent.message_id, false); // loud pin
+  } catch (e) {}
   rec.fulltimeSent = true;
   saveStateNow();
 }
@@ -583,12 +623,15 @@ async function checkGoals(m, detail) {
     const scorer = (g.scorer && g.scorer.name) || 'unknown';
     const min = (g.minute != null ? g.minute + "'" : (liveMinute(m) ? liveMinute(m) + "'" : "?'"));
     let scoringTeam = '';
-    if (g.team && g.team.id === (m.homeTeam && m.homeTeam.id)) scoringTeam = teamName(m.homeTeam);
-    else if (g.team && g.team.id === (m.awayTeam && m.awayTeam.id)) scoringTeam = teamName(m.awayTeam);
+    let scoringFlag = '';
+    if (g.team && g.team.id === (m.homeTeam && m.homeTeam.id)) { scoringTeam = teamName(m.homeTeam); scoringFlag = teamFlag(m.homeTeam); }
+    else if (g.team && g.team.id === (m.awayTeam && m.awayTeam.id)) { scoringTeam = teamName(m.awayTeam); scoringFlag = teamFlag(m.awayTeam); }
 
-    const text = pick(GOAL_OPENERS) + '\n' + scoreLine(m) + '\n' +
-      scorer + (scoringTeam ? ' (' + scoringTeam + ')' : '') + ' ' + min;
-    try { await bot.telegram.sendMessage(state.groupId, text); } catch (e) {}
+    const text = '<b>' + pick(GOAL_OPENERS) + '</b>\n\n' +
+      scoringFlag + ' <b>' + esc(scorer) + '</b> <i>' + min + '</i>' +
+      (scoringTeam ? '\n<i>for ' + esc(scoringTeam) + '</i>' : '') + '\n\n' +
+      scoreLine(m);
+    try { await sendHTML(state.groupId, text); } catch (e) {}
   }
   // clean old goalAt entries (>5min)
   for (const k in rec.goalAt) if (now - rec.goalAt[k] > 300000) delete rec.goalAt[k];
@@ -609,8 +652,8 @@ async function checkScoreChange(m, detail) {
     const recentGoal = rec.goalAt && Object.values(rec.goalAt).some(t => Date.now() - t < 30000);
     if (!recentGoal) {
       const min = liveMinute(m);
-      const text = pick(PREGOAL_LINES) + '\n' + scoreLine(detail || m) + (min ? '\n' + min + "'" : '');
-      try { await bot.telegram.sendMessage(state.groupId, text); } catch (e) {}
+      const text = '<b>' + pick(PREGOAL_LINES) + '</b>\n\n' + scoreLine(detail || m) + (min ? '\n<i>' + min + "'</i>" : '');
+      try { await sendHTML(state.groupId, text); } catch (e) {}
       // mark this as a "pre" alert so the full alert is suppressed if it arrives within 60s
       if (!rec.goalAt) rec.goalAt = {};
       rec.goalAt['__pre__' + newTotal] = Date.now();
@@ -770,7 +813,6 @@ bot.on('message', async (ctx, next) => {
 
 // ---------- Community commands ----------
 bot.command('match', async (ctx) => {
-  // current live match
   const matches = todayCache.data || await fetchTodayMatches();
   const live = matches.find(m => m.status === 'LIVE' || m.status === 'IN_PLAY' || m.status === 'PAUSED');
   if (!live) {
@@ -779,8 +821,8 @@ bot.command('match', async (ctx) => {
     }).catch(() => {});
   }
   const min = liveMinute(live);
-  const text = scoreLine(live) + (min != null ? '\n' + min + "'" : '');
-  try { await ctx.reply(text); } catch (e) {}
+  const text = scoreLine(live) + (min != null ? '\n<i>' + min + "'</i>" : '');
+  try { await sendHTML(ctx.chat.id, text); } catch (e) {}
 });
 
 bot.command('today', async (ctx) => {
@@ -790,8 +832,9 @@ bot.command('today', async (ctx) => {
       setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, s.message_id).catch(() => {}), 30000);
     }).catch(() => {});
   }
-  const lines = matches.map(fmtMatchLine);
-  try { await ctx.reply(lines.join('\n')); } catch (e) {}
+  const lines = ['<b>' + E.ball + ' today</b>', ''];
+  for (const m of matches) lines.push(fmtMatchLine(m));
+  try { await sendHTML(ctx.chat.id, lines.join('\n')); } catch (e) {}
 });
 
 bot.command('next', async (ctx) => {
@@ -803,7 +846,7 @@ bot.command('next', async (ctx) => {
       setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, s.message_id).catch(() => {}), 30000);
     }).catch(() => {});
   }
-  try { await ctx.reply(fmtMatchLine(upcoming[0])); } catch (e) {}
+  try { await sendHTML(ctx.chat.id, fmtMatchLine(upcoming[0])); } catch (e) {}
 });
 
 // ---------- Admin commands ----------
@@ -922,11 +965,19 @@ bot.command('test_match', async (ctx) => {
   await ctx.reply('simulation starting (no group lock, no state writes)');
 
   const delay = (ms) => new Promise(r => setTimeout(r, ms));
+  const hf = teamFlag(sampleMatch.homeTeam), af = teamFlag(sampleMatch.awayTeam);
+  const hn = teamName(sampleMatch.homeTeam), an = teamName(sampleMatch.awayTeam);
+
+  // schedule preview (silent pin would happen here in real flow)
+  await delay(1500);
+  await sendHTML(groupId, '<b>' + E.ball + ' coming up</b>\n\n' + hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af);
 
   // kickoff
-  await delay(2000);
-  await bot.telegram.sendMessage(groupId,
-    teamName(sampleMatch.homeTeam) + ' vs ' + teamName(sampleMatch.awayTeam) + '\n' + pick(KICKOFF_LINES));
+  await delay(2500);
+  await sendHTML(groupId,
+    '<b>' + E.lock + ' KICKOFF</b>\n\n' +
+    hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af + '\n' +
+    pick(KICKOFF_LINES));
 
   // goals (compressed timing)
   let runningHome = 0, runningAway = 0;
@@ -937,32 +988,36 @@ bot.command('test_match', async (ctx) => {
     // halftime check at minute 45+
     if (g.minute > 45 && i > 0 && sampleGoals[i - 1].minute <= 45) {
       await delay(3000);
-      await bot.telegram.sendMessage(groupId, pick(HT_LINES) + '\n' +
-        teamName(sampleMatch.homeTeam) + ' ' + runningHome + ' - ' + runningAway + ' ' + teamName(sampleMatch.awayTeam));
-      await delay(2000);
-      await bot.telegram.sendMessage(groupId, pick(SH_LINES));
+      await sendHTML(groupId, '<b>' + E.unlock + ' HALF-TIME</b>\n\n' +
+        esc(hn) + '  <b>' + runningHome + ' - ' + runningAway + '</b>  ' + esc(an) + '\n' +
+        pick(HT_LINES));
+      await delay(2500);
+      await sendHTML(groupId, '<b>' + E.lock + ' SECOND HALF</b>\n' + pick(SH_LINES));
     }
 
     await delay(3500);
-    const scoringTeam = g.team.id === 1 ? teamName(sampleMatch.homeTeam) : teamName(sampleMatch.awayTeam);
-    await bot.telegram.sendMessage(groupId,
-      pick(GOAL_OPENERS) + '\n' +
-      teamName(sampleMatch.homeTeam) + ' ' + runningHome + ' - ' + runningAway + ' ' + teamName(sampleMatch.awayTeam) + '\n' +
-      g.scorer.name + ' (' + scoringTeam + ') ' + g.minute + "'");
+    const scoringTeam = g.team.id === 1 ? hn : an;
+    const scoringFlag = g.team.id === 1 ? hf : af;
+    await sendHTML(groupId,
+      '<b>' + pick(GOAL_OPENERS) + '</b>\n\n' +
+      scoringFlag + ' <b>' + esc(g.scorer.name) + '</b> <i>' + g.minute + "'</i>\n" +
+      '<i>for ' + esc(scoringTeam) + '</i>\n\n' +
+      esc(hn) + '  <b>' + runningHome + ' - ' + runningAway + '</b>  ' + esc(an));
   }
 
   // fulltime
   await delay(3000);
   const home = [], away = [];
   for (const g of sampleGoals) {
-    const line = g.scorer.name + ' ' + g.minute + "'";
+    const line = esc(g.scorer.name) + ' <i>' + g.minute + "'</i>";
     if (g.team.id === 1) home.push(line); else away.push(line);
   }
-  await bot.telegram.sendMessage(groupId,
-    pick(FT_LINES) + '\n' +
-    teamName(sampleMatch.homeTeam) + ' ' + runningHome + ' - ' + runningAway + ' ' + teamName(sampleMatch.awayTeam) + '\n\n' +
-    teamName(sampleMatch.homeTeam) + ': ' + home.join(', ') + '\n' +
-    teamName(sampleMatch.awayTeam) + ': ' + away.join(', '));
+  await sendHTML(groupId,
+    '<b>' + E.unlock + ' FULL TIME ' + E.party + '</b>\n\n' +
+    esc(hn) + '  <b>' + runningHome + ' - ' + runningAway + '</b>  ' + esc(an) + '\n\n' +
+    '<b>' + esc(hn) + '</b>\n' + home.join(', ') + '\n\n' +
+    '<b>' + esc(an) + '</b>\n' + away.join(', ') + '\n\n' +
+    pick(FT_LINES));
 
   await delay(1500);
   await ctx.reply('simulation done. no state was modified. no api calls used.');
