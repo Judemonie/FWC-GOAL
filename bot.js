@@ -50,8 +50,8 @@ const FWC_DECIMALS = parseInt(process.env.FWC_DECIMALS || '18', 10);
 const REWARD_WALLET_KEY = process.env.REWARD_WALLET_KEY || '';
 const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() === 'true';
 
-// Holder gate: minimum USD value of FWC required to predict
-const MIN_HOLD_USD = parseFloat(process.env.MIN_HOLD_USD || '15');
+// Holder gate: minimum FWC token amount required to predict (price-independent)
+const MIN_HOLD_FWC = parseFloat(process.env.MIN_HOLD_FWC || '2026000');
 
 // Bag scaling for share weighting in pool split (sqrt formula, capped)
 const BAG_MULTIPLIER_CAP = parseFloat(process.env.BAG_MULTIPLIER_CAP || '5');
@@ -200,6 +200,12 @@ function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 function esc(s) {
   if (s == null) return '';
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Format FWC amount with thousand separators (full length, not M shorthand)
+function fmtFwc(amount) {
+  const n = Math.round(Number(amount) || 0);
+  return n.toLocaleString('en-US');
 }
 
 async function isAdmin(ctx) {
@@ -423,7 +429,7 @@ async function checkFwcHolder(wallet) {
         balance: ethers.utils.formatUnits(bal, FWC_DECIMALS),
         balanceFwc,
         balanceUsd,
-        meetsGate: balanceUsd >= MIN_HOLD_USD
+        meetsGate: balanceFwc >= MIN_HOLD_FWC
       };
     } catch (err) {
       console.log('holder check attempt ' + attempt + ' err:', err.message);
@@ -432,10 +438,10 @@ async function checkFwcHolder(wallet) {
   return { isHolder: false, balance: '0', balanceFwc: 0, balanceUsd: 0, meetsGate: false };
 }
 
-// Calculate bag-size multiplier (sqrt formula, capped)
-function bagMultiplier(balanceUsd) {
-  if (balanceUsd < MIN_HOLD_USD) return 0;
-  const m = Math.sqrt(balanceUsd / MIN_HOLD_USD);
+// Calculate bag-size multiplier (sqrt formula, capped) - based on FWC amount ratio
+function bagMultiplier(balanceFwc) {
+  if (balanceFwc < MIN_HOLD_FWC) return 0;
+  const m = Math.sqrt(balanceFwc / MIN_HOLD_FWC);
   return Math.min(BAG_MULTIPLIER_CAP, Math.max(1, m));
 }
 
@@ -808,7 +814,7 @@ bot.action(/^VOTE_(.+)$/, async (ctx) => {
   }
   const h = await checkFwcHolder(u.wallet);
   if (!h.meetsGate) {
-    return ctx.answerCbQuery('need $' + MIN_HOLD_USD + ' of FWC to vote', { show_alert: true });
+    return ctx.answerCbQuery('need ' + fmtFwc(MIN_HOLD_FWC) + ' FWC to vote', { show_alert: true });
   }
 
   const prev = v.votes[userId];
@@ -929,7 +935,7 @@ async function ensurePredictionForMatch(m) {
   if (!state.predictionMsgs[id].reminderMsgId) {
     try {
       const reminder = await sendHTML(state.groupId,
-        '<i>new match incoming. need at least $' + MIN_HOLD_USD + ' of FWC to predict. see pinned instructions.</i>');
+        '<i>new match incoming. need at least ' + fmtFwc(MIN_HOLD_FWC) + ' FWC to predict. see pinned instructions.</i>');
       state.predictionMsgs[id].reminderMsgId = reminder.message_id;
     } catch (e) {}
   }
@@ -1070,8 +1076,8 @@ bot.action(/^PR_(.+)_(q|p|e)_(.+)$/, async (ctx) => {
     if (!h.meetsGate) {
       try {
         await bot.telegram.sendMessage(userId,
-          E.warn + ' your wallet holds $' + h.balanceUsd.toFixed(2) + ' of FWC.\n' +
-          'minimum required: $' + MIN_HOLD_USD + '\n\n' +
+          E.warn + ' your wallet holds <b>' + fmtFwc(h.balanceFwc) + ' FWC</b>.\n' +
+          'minimum required: <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>\n\n' +
           'buy more FWC and try again, or send a different wallet by tapping a prediction again.',
           { parse_mode: 'HTML' });
       } catch (e) {}
@@ -1084,13 +1090,13 @@ bot.action(/^PR_(.+)_(q|p|e)_(.+)$/, async (ctx) => {
       username: u.username,
       ts: Date.now(),
       locked: true,
-      entryBalanceUsd: h.balanceUsd
+      entryBalanceFwc: h.balanceFwc
     };
     saveStateNow();
     try {
       await bot.telegram.sendMessage(userId,
         E.check + ' locked: <b>' + esc(decodeChoice(choice, pool, match)) + '</b>\n' +
-        'bag at entry: $' + h.balanceUsd.toFixed(2) + ' (' + bagMultiplier(h.balanceUsd).toFixed(2) + 'x reward)\n' +
+        'bag at entry: ' + fmtFwc(h.balanceFwc) + ' FWC (' + bagMultiplier(h.balanceFwc).toFixed(2) + 'x reward)\n' +
         'good luck.',
         { parse_mode: 'HTML' });
     } catch (e) {}
@@ -1104,7 +1110,7 @@ bot.action(/^PR_(.+)_(q|p|e)_(.+)$/, async (ctx) => {
     await bot.telegram.sendMessage(userId,
       'got your pick: <b>' + esc(decodeChoice(choice, pool, match)) + '</b>\n\n' +
       'send your BSC wallet address (0x...) here to lock it in.\n\n' +
-      '<i>you must hold at least $' + MIN_HOLD_USD + ' of FWC in that wallet.</i>',
+      '<i>you must hold at least ' + fmtFwc(MIN_HOLD_FWC) + ' FWC in that wallet.</i>',
       { parse_mode: 'HTML' });
     return ctx.answerCbQuery('check your DM to send wallet');
   } catch (e) {
@@ -1151,8 +1157,8 @@ bot.on('text', async (ctx, next) => {
   const h = await checkFwcHolder(wallet);
   if (!h.meetsGate) {
     return ctx.reply(
-      E.warn + ' this wallet holds $' + h.balanceUsd.toFixed(2) + ' of FWC.\n' +
-      'minimum to predict: $' + MIN_HOLD_USD + '\n\n' +
+      E.warn + ' this wallet holds <b>' + fmtFwc(h.balanceFwc) + ' FWC</b>.\n' +
+      'minimum to predict: <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>\n\n' +
       'either buy more FWC and try again, or send a wallet that holds enough.',
       { parse_mode: 'HTML' });
   }
@@ -1189,19 +1195,19 @@ bot.on('text', async (ctx, next) => {
     username: u.username,
     ts: Date.now(),
     locked: true,
-    entryBalanceUsd: h.balanceUsd
+    entryBalanceFwc: h.balanceFwc
   };
   u.wallet = wallet.toLowerCase();
   u.lastSet = Date.now();
   u.awaitingFor = null;
   saveStateNow();
 
-  const mult = bagMultiplier(h.balanceUsd);
+  const mult = bagMultiplier(h.balanceFwc);
   await ctx.reply(
     E.check + ' <b>locked in</b>\n\n' +
     'pick: ' + esc(decodeChoice(choice, pool, match)) + '\n' +
     'wallet: <code>' + esc(wallet) + '</code>\n' +
-    'bag: $' + h.balanceUsd.toFixed(2) + ' FWC (' + mult.toFixed(2) + 'x reward multiplier)\n\n' +
+    'bag: ' + fmtFwc(h.balanceFwc) + ' FWC (' + mult.toFixed(2) + 'x reward multiplier)\n\n' +
     '<i>watch the match. winners get FWC after full-time.</i>',
     { parse_mode: 'HTML' });
 });
@@ -1380,10 +1386,10 @@ async function calculateWinnersForMatch(m, detail) {
     for (const cand of correctArr) {
       const h = await checkFwcHolder(cand.wallet);
       if (!h.meetsGate) {
-        console.log('skipping ' + cand.username + ' - bag $' + h.balanceUsd.toFixed(2));
+        console.log('skipping ' + cand.username + ' - bag ' + fmtFwc(h.balanceFwc) + ' FWC');
         continue;
       }
-      eligible.push({ ...cand, balanceUsd: h.balanceUsd, weight: bagMultiplier(h.balanceUsd) });
+      eligible.push({ ...cand, balanceFwc: h.balanceFwc, balanceUsd: h.balanceUsd, weight: bagMultiplier(h.balanceFwc) });
     }
     if (!eligible.length) {
       // no one eligible, rollover
@@ -1451,6 +1457,7 @@ async function calculateWinnersForMatch(m, detail) {
       username: w.username,
       wallet: w.wallet,
       pool: w.pool,
+      bagFwc: w.balanceFwc,
       bagUsd: w.balanceUsd,
       shareWeight: w.weight,
       amountUSD: w.amountUsd,
@@ -1915,7 +1922,7 @@ bot.command('start', async (ctx) => {
       'i am the FWC prediction bot. you are all set to predict now.',
       '',
       '<b>how to play:</b>',
-      '1. hold at least $' + MIN_HOLD_USD + ' of FWC in your wallet',
+      '1. hold at least ' + fmtFwc(MIN_HOLD_FWC) + ' FWC in your wallet',
       '2. go back to the group',
       '3. tap a prediction button when a match is coming up',
       '4. i will ask for your wallet here in DM',
@@ -1948,50 +1955,33 @@ bot.command('help', async (ctx) => {
 });
 
 function buildInstructionsText(botUsername) {
-  const handle = botUsername ? '@' + botUsername : 'my username';
+  const handle = botUsername ? '@' + botUsername : 'me';
   return [
-    '<b>' + E.trophy + ' how FWC predictions work</b>',
+    '<b>' + E.trophy + ' FWC PREDICTIONS</b>',
     '',
-    '<b>step 1: hold</b>',
-    'you need at least $' + MIN_HOLD_USD + ' of FWC in your wallet',
+    '<b>before you play (one time):</b>',
+    '\u2022 hold at least <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b> in your wallet',
+    '\u2022 tap ' + handle + ' \u2192 <b>Start</b> to open a DM with me',
     '',
-    '<b>step 2: start me in DM</b>',
-    'tap ' + handle + ' to open a chat with me, then tap <b>Start</b>',
-    '(you only do this once)',
+    '<b>how a match day works:</b>',
+    '<b>' + VOTE_HOUR_UTC + 'am UTC</b> \u2014 if matches are on today, i post a vote in the group. you pick which match should have predictions.',
+    '<b>2 hours before kickoff</b> \u2014 vote closes, winning match announced.',
+    '<b>1 hour before kickoff</b> \u2014 prediction pools open. three to choose from:',
+    '   \u2022 EASY: just pick the winner',
+    '   \u2022 MEDIUM: winner + over/under 2.5 goals',
+    '   \u2022 HARD: total goals (0, 1, 2, 3, 4+)',
+    '<b>kickoff</b> \u2014 pools close, chat locks.',
+    '<b>full-time</b> \u2014 correct predictors split the pool.',
     '',
-    '<b>step 3: vote on the match</b>',
-    'every day at 5am UTC i post a vote',
-    'community picks which match(es) get predictions',
-    '1-3 matches that day = 1 match selected',
-    '4-6 matches = 2 matches selected',
-    'vote closes 2h before kickoff',
+    '<b>first time picking:</b>',
+    'tap a pool button \u2192 i DM you \u2192 paste your wallet \u2192 done. saved for future matches.',
     '',
-    '<b>step 4: predict</b>',
-    'once matches are selected, three pools open:',
-    '  EASY: pick the winner',
-    '  MEDIUM: winner + over/under 2.5 goals',
-    '  HARD: total goals range',
-    'pick ONE pool. tap your choice.',
+    '<b>daily pool:</b>',
+    'easy $' + EASY_POOL_USD + ' | medium $' + MEDIUM_POOL_USD + ' | hard $' + HARD_POOL_USD,
+    'split among correct holders. bigger bag = bigger share.',
+    'nobody wins a pool? it rolls into tomorrow.',
     '',
-    '<b>step 5: send wallet (first time only)</b>',
-    'i DM you, you paste your 0x... wallet',
-    'i check your bag. if you have $' + MIN_HOLD_USD + '+, locked in.',
-    '',
-    '<b>step 6: win</b>',
-    'after full-time, all correct predictors split the pool',
-    'bigger bag = bigger share',
-    'no winners? pool rolls to next day',
-    '',
-    '<b>daily prize pool</b>',
-    'easy: $' + EASY_POOL_USD + ' | medium: $' + MEDIUM_POOL_USD + ' | hard: $' + HARD_POOL_USD,
-    'total: $' + (EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD) + ' per day',
-    'split equally across selected matches',
-    '',
-    '<b>commands</b>',
-    '/mywallet - your saved wallet',
-    '/help - all commands',
-    '',
-    '<i>community token. not affiliated with any official organization. not financial advice. dyor.</i>'
+    '<i>community token. not affiliated. dyor.</i>'
   ].join('\n');
 }
 
@@ -2104,7 +2094,7 @@ bot.command('status', async (ctx) => {
     '',
     '<b>rewards</b>',
     'mode: ' + (DRY_RUN ? 'DRY RUN' : 'LIVE'),
-    'min hold to predict: $' + MIN_HOLD_USD,
+    'min hold to predict: ' + fmtFwc(MIN_HOLD_FWC) + ' FWC',
     'daily pool: $' + (EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD),
     'rollover: easy $' + state.rollover.easy.toFixed(2) + ' / med $' + state.rollover.medium.toFixed(2) + ' / hard $' + state.rollover.hard.toFixed(2),
     'pending: ' + state.pendingRewards.filter(r => r.status === 'pending').length,
