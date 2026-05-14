@@ -1572,6 +1572,7 @@ async function processApprovedBatch(ctx) {
   const dt = state.dailyTotals[dateKey];
 
   let okCount = 0, failCount = 0;
+  let sentTotalUsd = 0, sentTotalFwc = 0;
   const results = [];
   for (const r of pending) {
     try {
@@ -1594,13 +1595,22 @@ async function processApprovedBatch(ctx) {
       dt.sentUSD += r.amountUSD;
       state.approvedRewards.push(r);
       okCount++;
+      sentTotalUsd += r.amountUSD;
+      sentTotalFwc += r.amountFWC;
       results.push((sendRes.dryRun ? 'DRY ' : '') + 'sent ' + r.amountFWC.toFixed(2) + ' FWC to @' + (r.username || 'user') + ' tx:' + sendRes.txHash.slice(0, 14) + '...');
+      // DM the winner with full details
       try {
+        const poolLabel = r.pool === 'quick' ? 'easy' : r.pool === 'pro' ? 'medium' : 'hard';
+        const scanUrl = 'https://bscscan.com/tx/' + sendRes.txHash;
         await bot.telegram.sendMessage(r.userId,
           (sendRes.dryRun ? '<b>[DRY RUN]</b> ' : '') +
-          E.trophy + ' congrats! you won ' + r.amountFWC.toFixed(2) + ' FWC ($' + r.amountUSD.toFixed(2) + ')\n' +
-          'tx: <code>' + esc(sendRes.txHash) + '</code>',
-          { parse_mode: 'HTML' });
+          E.trophy + ' <b>you won!</b>\n\n' +
+          'pool: ' + poolLabel + '\n' +
+          'match: ' + esc(r.matchLabel || '?') + '\n' +
+          'amount: <b>' + r.amountFWC.toFixed(2) + ' FWC</b> ($' + r.amountUSD.toFixed(2) + ')\n\n' +
+          'tx hash:\n<code>' + esc(sendRes.txHash) + '</code>\n\n' +
+          (sendRes.dryRun ? '<i>(test mode - no real funds moved)</i>' : '<a href="' + scanUrl + '">view on BSCScan</a>'),
+          { parse_mode: 'HTML', disable_web_page_preview: true });
       } catch (e) {}
     } catch (err) {
       r.status = 'failed';
@@ -1612,11 +1622,24 @@ async function processApprovedBatch(ctx) {
   state.pendingRewards = state.pendingRewards.filter(r => r.status === 'pending');
   saveStateNow();
 
+  // owner gets full batch summary in DM
   const summary = '<b>batch result</b>\n\n' +
     okCount + ' sent, ' + failCount + ' failed\n' +
     'sent today: $' + dt.sentUSD.toFixed(2) + '\n\n' +
     '<pre>' + esc(results.join('\n')) + '</pre>';
   try { await ctx.reply(summary, { parse_mode: 'HTML' }); } catch (e) {}
+
+  // group gets a clean, non-spammy announcement
+  if (okCount > 0 && state.groupId) {
+    try {
+      const groupMsg = '<b>' + E.trophy + ' rewards sent</b>\n\n' +
+        okCount + ' winner' + (okCount > 1 ? 's' : '') + ' paid\n' +
+        'total: ' + sentTotalFwc.toFixed(2) + ' FWC ($' + sentTotalUsd.toFixed(2) + ')\n\n' +
+        '<i>each winner received their transaction hash via DM.</i>' +
+        (DRY_RUN ? '\n<i>(dry run mode)</i>' : '');
+      await sendHTML(state.groupId, groupMsg);
+    } catch (e) { console.log('group announce err:', e.message); }
+  }
 }
 
 // daily batch check on tick
