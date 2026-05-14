@@ -132,8 +132,22 @@ async function loadState() {
     const data = await r.json();
     stateSha = data.sha;
     const content = Buffer.from(data.content, 'base64').toString('utf8');
-    state = Object.assign(state, JSON.parse(content));
-    console.log('State loaded');
+    const loaded = JSON.parse(content);
+    // deep-merge settings so any newly added defaults stay enabled
+    const defaultSettings = state.settings;
+    const loadedSettings = loaded.settings || {};
+    loaded.settings = Object.assign({}, defaultSettings, loadedSettings);
+    // ensure newer top-level keys exist with defaults
+    if (!loaded.rollover) loaded.rollover = { easy: 0, medium: 0, hard: 0 };
+    if (!loaded.dailyVote) loaded.dailyVote = {};
+    if (!loaded.predictions) loaded.predictions = {};
+    if (!loaded.predictionMsgs) loaded.predictionMsgs = {};
+    if (!loaded.userWallets) loaded.userWallets = {};
+    if (!loaded.pendingRewards) loaded.pendingRewards = [];
+    if (!loaded.approvedRewards) loaded.approvedRewards = [];
+    if (!loaded.dailyTotals) loaded.dailyTotals = {};
+    state = Object.assign(state, loaded);
+    console.log('State loaded. predictions setting:', state.settings.predictions);
   } catch (err) { console.log('loadState err:', err.message); }
 }
 
@@ -1911,6 +1925,7 @@ bot.command('help', async (ctx) => {
 });
 
 function buildInstructionsText(botUsername) {
+  const handle = botUsername ? '@' + botUsername : 'my username';
   return [
     '<b>' + E.trophy + ' how FWC predictions work</b>',
     '',
@@ -1918,7 +1933,7 @@ function buildInstructionsText(botUsername) {
     'you need at least $' + MIN_HOLD_USD + ' of FWC in your wallet',
     '',
     '<b>step 2: start me in DM</b>',
-    'tap my name above this group, then tap <b>Start</b>',
+    'tap ' + handle + ' to open a chat with me, then tap <b>Start</b>',
     '(you only do this once)',
     '',
     '<b>step 3: vote on the match</b>',
