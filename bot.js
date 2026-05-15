@@ -2176,9 +2176,10 @@ bot.command('help', async (ctx) => {
       '/setup /instructions /settings /status',
       '/lock /unlock /autopilot_on /autopilot_off',
       '/predictions /rewardwallet /sendbatch',
+      '/reset_state (DM only, danger)',
       '',
       'community:',
-      '/match /today /next /mywallet'
+      '/match /today /next /mywallet /wallet'
     ].join('\n'));
   } else {
     await ctx.reply('/match /today /next /mywallet\n\ncheck pinned message for how to predict');
@@ -2216,6 +2217,53 @@ function buildInstructionsText(botUsername) {
   ].join('\n');
 }
 
+bot.command('reset_state', async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return;
+  if (ctx.chat.type !== 'private') {
+    try { await ctx.deleteMessage(); } catch (e) {}
+    try { await bot.telegram.sendMessage(ctx.from.id, 'run /reset_state in DM only'); } catch (e) {}
+    return;
+  }
+  await sendHTML(ctx.chat.id,
+    E.warn + ' <b>danger zone</b>\n\n' +
+    'this wipes: wallets, predictions, votes, offenses, pending rewards, rollover, daily totals.\n' +
+    'keeps: settings, groupId, autopilot flag.\n\n' +
+    'a backup is saved to GitHub first.\n\n' +
+    'are you sure?',
+    Markup.inlineKeyboard([
+      [Markup.button.callback(E.warn + ' yes, wipe data', 'RESET_CONFIRM')],
+      [Markup.button.callback('cancel', 'RESET_CANCEL')]
+    ]));
+});
+
+bot.action('RESET_CONFIRM', async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
+  await ctx.answerCbQuery('wiping...');
+  // force a backup now
+  lastBackupAt = 0;
+  await maybeBackup().catch(() => {});
+  // wipe
+  state.userWallets = {};
+  state.predictions = {};
+  state.predictionMsgs = {};
+  state.pendingRewards = [];
+  state.approvedRewards = [];
+  state.dailyVote = {};
+  state.dailyTotals = {};
+  state.offenses = {};
+  state.trackedMatches = {};
+  state.rollover = { easy: 0, medium: 0, hard: 0 };
+  state.schedulePostedFor = '';
+  state.instructionsMsgId = null;
+  await saveStateNow();
+  try { await ctx.editMessageText(E.check + ' state wiped. ready for production.\n\nrun /setup in the new group when ready.'); } catch (e) {}
+});
+
+bot.action('RESET_CANCEL', async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
+  await ctx.answerCbQuery('cancelled');
+  try { await ctx.editMessageText('cancelled. nothing changed.'); } catch (e) {}
+});
 bot.command('setup', async (ctx) => {
   if (!await isAdmin(ctx)) return;
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
@@ -2223,6 +2271,7 @@ bot.command('setup', async (ctx) => {
   }
   state.groupId = ctx.chat.id;
   saveStateNow();
+
   const text = [
     'setup',
     '',
