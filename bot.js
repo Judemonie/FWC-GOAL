@@ -65,11 +65,8 @@ const HARD_POOL_USD = parseFloat(process.env.HARD_POOL_USD || '25');
 const PER_WIN_CAP_USD = parseFloat(process.env.PER_WIN_CAP_USD || '25');
 
 // Voting/selection
-const VOTE_HOUR_UTC = parseInt(process.env.VOTE_HOUR_UTC || '5', 10);  // 5am UTC daily vote
+const VOTE_HOUR_UTC = parseInt(process.env.VOTE_HOUR_UTC || '5', 10);  // also when daily schedule posts
 const VOTE_CLOSE_HOURS_BEFORE = parseFloat(process.env.VOTE_CLOSE_HOURS_BEFORE || '2');
-
-// When the bot posts today's schedule (separate from vote)
-const SCHEDULE_HOUR_UTC = parseInt(process.env.SCHEDULE_HOUR_UTC || '6', 10);
 
 // Auto-repost active prompts after this many non-bot group messages
 const REPOST_THRESHOLD = parseInt(process.env.REPOST_THRESHOLD || '8', 10);
@@ -1962,8 +1959,8 @@ async function autopilotTick() {
     if (hourUtc >= VOTE_HOUR_UTC && hourUtc < VOTE_HOUR_UTC + 2) {
       await postDailyVote().catch(e => console.log('vote post err:', e.message));
     }
-    // Daily schedule: post at SCHEDULE_HOUR_UTC
-    if (hourUtc >= SCHEDULE_HOUR_UTC && hourUtc <= 22 && now - lastSchedulePoll > 60000) {
+    // Daily schedule: same hour as vote (only matters if predictions are off)
+    if (hourUtc >= VOTE_HOUR_UTC && hourUtc <= 22 && now - lastSchedulePoll > 60000) {
       await postDailySchedule();
       lastSchedulePoll = now;
     }
