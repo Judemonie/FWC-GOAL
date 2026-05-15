@@ -68,6 +68,14 @@ const PER_WIN_CAP_USD = parseFloat(process.env.PER_WIN_CAP_USD || '25');
 const VOTE_HOUR_UTC = parseInt(process.env.VOTE_HOUR_UTC || '5', 10);  // 5am UTC daily vote
 const VOTE_CLOSE_HOURS_BEFORE = parseFloat(process.env.VOTE_CLOSE_HOURS_BEFORE || '2');
 
+// When the bot posts today's schedule (separate from vote)
+const SCHEDULE_HOUR_UTC = parseInt(process.env.SCHEDULE_HOUR_UTC || '6', 10);
+
+// Auto-repost active prompts after this many non-bot group messages
+const REPOST_THRESHOLD = parseInt(process.env.REPOST_THRESHOLD || '8', 10);
+// Max times we will repost a single prompt (avoid infinite spam)
+const REPOST_MAX = parseInt(process.env.REPOST_MAX || '5', 10);
+
 
 if (!BOT_TOKEN) { console.error('Missing BOT_TOKEN'); process.exit(1); }
 if (!WEBHOOK_URL) { console.error('Missing WEBHOOK_URL'); process.exit(1); }
@@ -174,6 +182,8 @@ async function saveStateNow() {
     if (r.ok) {
       const data = await r.json();
       if (data.content && data.content.sha) stateSha = data.content.sha;
+      // also write a rotating backup once every ~30 min
+      maybeBackup();
     } else if (r.status === 409 || r.status === 422) {
       stateSha = null;
       await loadState();
@@ -185,6 +195,50 @@ async function saveStateNow() {
     saveInFlight = false;
     if (pendingSave) { pendingSave = false; setTimeout(saveStateNow, 1500); }
   }
+}
+
+// Rotating backups (5 slots)
+let lastBackupAt = 0;
+let backupShaMap = {};
+async function maybeBackup() {
+  if (!GITHUB_TOKEN || !GITHUB_REPO) return;
+  const now = Date.now();
+  // backup at most every 30 minutes
+  if (now - lastBackupAt < 30 * 60 * 1000) return;
+  lastBackupAt = now;
+  const slot = (Math.floor(now / (30 * 60 * 1000)) % 5) + 1;
+  const filename = 'state-backup-' + slot + '.json';
+  try {
+    // get current sha if exists
+    const headers = {
+      'Authorization': 'token ' + GITHUB_TOKEN,
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'fwcg-bot'
+    };
+    if (!backupShaMap[slot]) {
+      const head = await fetch('https://api.github.com/repos/' + GITHUB_REPO + '/contents/' + filename, { headers });
+      if (head.ok) {
+        const d = await head.json();
+        backupShaMap[slot] = d.sha;
+      }
+    }
+    const body = {
+      message: 'backup slot ' + slot,
+      content: Buffer.from(JSON.stringify(state, null, 2)).toString('base64')
+    };
+    if (backupShaMap[slot]) body.sha = backupShaMap[slot];
+    const r = await fetch('https://api.github.com/repos/' + GITHUB_REPO + '/contents/' + filename, {
+      method: 'PUT',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
+      body: JSON.stringify(body)
+    });
+    if (r.ok) {
+      const d = await r.json();
+      if (d.content && d.content.sha) backupShaMap[slot] = d.content.sha;
+    } else if (r.status === 409 || r.status === 422) {
+      backupShaMap[slot] = null;
+    }
+  } catch (err) { console.log('backup err:', err.message); }
 }
 
 // debounced save (for non-critical updates like offense counts)
@@ -727,6 +781,42 @@ async function postDailyVote() {
     return;
   }
 
+  // post instructions first if not already there
+  if (!state.instructionsMsgId) {
+    await postInstructions(state.groupId).catch(() => {});
+  }
+
+  // SHORTCUT: only one match today - skip the vote, auto-select it
+  if (upcoming.length === 1) {
+    const onlyMatch = upcoming[0];
+    state.dailyVote[dateKey] = {
+      matchIds: [String(onlyMatch.id)],
+      votes: {},
+      msgId: null,
+      postedAt: Date.now(),
+      closed: true,
+      selected: [String(onlyMatch.id)],
+      selectCount: 1,
+      perMatchPool: EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD,
+      autoSelected: true
+    };
+    saveStateNow();
+    const hf = teamFlag(onlyMatch.homeTeam), af = teamFlag(onlyMatch.awayTeam);
+    const ko = new Date(onlyMatch.utcDate);
+    const tStr = String(ko.getUTCHours()).padStart(2, '0') + ':' + String(ko.getUTCMinutes()).padStart(2, '0');
+    const announce = '<b>' + E.trophy + ' today\'s match</b>\n\n' +
+      'only one match scheduled. no vote needed.\n\n' +
+      hf + ' <b>' + esc(teamName(onlyMatch.homeTeam)) + '</b> vs <b>' + esc(teamName(onlyMatch.awayTeam)) + '</b> ' + af + '\n' +
+      tStr + ' UTC kickoff\n\n' +
+      'prediction pools open 1 hour before kickoff.\n' +
+      'pools: $' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard';
+    try {
+      const sent = await sendHTML(state.groupId, announce);
+      await pinMessage(state.groupId, sent.message_id, false);
+    } catch (e) { console.log('auto-select post err:', e.message); }
+    return;
+  }
+
   const selectCount = howManyToSelect(upcoming.length);
   const totalPool = EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD +
     (state.rollover.easy + state.rollover.medium + state.rollover.hard);
@@ -767,6 +857,8 @@ async function postDailyVote() {
       selectCount,
       perMatchPool
     };
+    // pin the vote post so it's easy to find
+    await pinMessage(state.groupId, sent.message_id, false);
     saveStateNow();
   } catch (e) { console.log('vote post err:', e.message); }
 }
@@ -810,11 +902,11 @@ bot.action(/^VOTE_(.+)$/, async (ctx) => {
   // require holder to vote (so randoms don't game it)
   const u = state.userWallets[userId];
   if (!u || !u.wallet) {
-    return ctx.answerCbQuery('submit a wallet first (tap any prediction or DM /start)', { show_alert: true });
+    return ctx.answerCbQuery('DM the bot /start to register your wallet first', { show_alert: true });
   }
   const h = await checkFwcHolder(u.wallet);
   if (!h.meetsGate) {
-    return ctx.answerCbQuery('need ' + fmtFwc(MIN_HOLD_FWC) + ' FWC to vote', { show_alert: true });
+    return ctx.answerCbQuery('need ' + fmtFwc(MIN_HOLD_FWC) + ' FWC to vote (you have ' + fmtFwc(h.balanceFwc) + ')', { show_alert: true });
   }
 
   const prev = v.votes[userId];
@@ -829,6 +921,86 @@ bot.action(/^VOTE_(.+)$/, async (ctx) => {
     }, 5000);
   }
 });
+
+// ---------- Auto-repost active prompts (Raid-bot style) ----------
+// Delete old vote/prediction message and repost it as the latest, so it stays visible above buy bots.
+// State (votes, predictions) is preserved - we only rebuild the visual message.
+
+async function maybeRepostVote() {
+  if (groupMsgCounterSinceVote < REPOST_THRESHOLD) return;
+  const dateKey = getDateKey();
+  const v = state.dailyVote[dateKey];
+  if (!v || v.closed || !v.msgId) return;
+  if (!state.settings.predictions) return;
+  v.repostCount = v.repostCount || 0;
+  if (v.repostCount >= REPOST_MAX) return;
+
+  // delete old
+  try { await bot.telegram.deleteMessage(state.groupId, v.msgId); } catch (e) {}
+
+  // rebuild buttons with current tallies
+  const matches = todayCache.data || [];
+  const tally = {};
+  for (const uid in v.votes) { const mid = v.votes[uid]; tally[mid] = (tally[mid] || 0) + 1; }
+  const rows = v.matchIds.map(mid => {
+    const m = matches.find(x => String(x.id) === mid);
+    if (!m) return null;
+    const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
+    const t = new Date(m.utcDate);
+    const tStr = String(t.getUTCHours()).padStart(2, '0') + ':' + String(t.getUTCMinutes()).padStart(2, '0');
+    const count = tally[mid] || 0;
+    const label = tStr + ' ' + hf + ' ' + teamName(m.homeTeam) + ' vs ' + teamName(m.awayTeam) + ' ' + af + ' (' + count + ')';
+    return [Markup.button.callback(label.slice(0, 60), 'VOTE_' + mid)];
+  }).filter(Boolean);
+
+  const totalVotes = Object.keys(v.votes).length;
+  const text = '<b>' + E.trophy + ' VOTE: today\'s prediction match</b>\n\n' +
+    'pick the match you want predictions on.\n' +
+    totalVotes + ' votes so far. <i>(reposted to stay visible)</i>';
+  try {
+    const sent = await sendHTML(state.groupId, text, Markup.inlineKeyboard(rows));
+    v.msgId = sent.message_id;
+    v.repostCount += 1;
+    await pinMessage(state.groupId, sent.message_id, true); // silent repin
+    groupMsgCounterSinceVote = 0;
+    saveStateNow();
+  } catch (e) { console.log('repost vote err:', e.message); }
+}
+
+async function maybeRepostPrediction() {
+  if (groupMsgCounterSincePrediction < REPOST_THRESHOLD) return;
+  const dateKey = getDateKey();
+  const v = state.dailyVote[dateKey];
+  if (!v || !v.closed || !v.selected.length) return;
+  if (!state.settings.predictions) return;
+  // only repost for matches that haven't kicked off yet
+  const matches = todayCache.data || [];
+  for (const mid of v.selected) {
+    const m = matches.find(x => String(x.id) === mid);
+    if (!m) continue;
+    if (m.status !== 'SCHEDULED' && m.status !== 'TIMED') continue; // already started
+    const pm = state.predictionMsgs[mid];
+    if (!pm || !pm.quickMsgId) continue; // pools not opened yet
+    pm.repostCount = pm.repostCount || 0;
+    if (pm.repostCount >= REPOST_MAX) continue;
+
+    // delete all three old pool messages
+    for (const k of ['quickMsgId', 'proMsgId', 'exactMsgId']) {
+      if (pm[k]) {
+        try { await bot.telegram.deleteMessage(state.groupId, pm[k]); } catch (e) {}
+        pm[k] = null;
+      }
+    }
+    pm.reminderMsgId = null;
+    pm.repostCount += 1;
+    saveStateNow();
+
+    // ensurePredictionForMatch will recreate them
+    await ensurePredictionForMatch(m);
+    groupMsgCounterSincePrediction = 0;
+    return; // one repost per tick
+  }
+}
 
 // Close vote 2 hours before earliest match
 async function maybeCloseVote() {
@@ -997,6 +1169,8 @@ async function ensurePredictionForMatch(m) {
     try {
       const sent = await sendHTML(state.groupId, exactText, Markup.inlineKeyboard(rows));
       state.predictionMsgs[id].exactMsgId = sent.message_id;
+      // pin the last prediction pool message so it stays visible above buy bots
+      await pinMessage(state.groupId, sent.message_id, false);
     } catch (e) { console.log('exact pred err:', e.message); }
   }
   saveStateNow();
@@ -1171,8 +1345,26 @@ bot.on('text', async (ctx, next) => {
       'one wallet per telegram account. please use a different wallet.');
   }
 
-  // sybil check: is this wallet already entered in this match by anyone else?
-  const { matchId, pool, choice } = u.awaitingFor;
+  // Branch on flow type
+  const awaitingFor = u.awaitingFor;
+  u.wallet = wallet.toLowerCase();
+  u.lastSet = Date.now();
+  u.awaitingFor = null;
+
+  if (awaitingFor.type === 'register') {
+    // standalone registration via /start or /wallet
+    saveStateNow();
+    const mult = bagMultiplier(h.balanceFwc);
+    return sendHTML(ctx.chat.id,
+      E.check + ' <b>wallet locked in</b>\n\n' +
+      'wallet: <code>' + esc(wallet) + '</code>\n' +
+      'bag: ' + fmtFwc(h.balanceFwc) + ' FWC (' + mult.toFixed(2) + 'x reward multiplier)\n\n' +
+      'you can now vote and predict in the group.\n' +
+      '<i>use /wallet here anytime to change it.</i>');
+  }
+
+  // prediction-tied flow (legacy path - user tapped a button without prior /start)
+  const { matchId, pool, choice } = awaitingFor;
   if (isWalletAlreadyUsedForMatch(matchId, wallet, userId)) {
     return ctx.reply(
       E.warn + ' this wallet has already been used to enter this match.\n' +
@@ -1183,9 +1375,8 @@ bot.on('text', async (ctx, next) => {
   const matches = todayCache.data || [];
   const match = matches.find(m => String(m.id) === matchId);
   if (!match || (match.status !== 'SCHEDULED' && match.status !== 'TIMED')) {
-    u.awaitingFor = null;
     saveStateNow();
-    return ctx.reply('that match has already started. predictions closed.');
+    return ctx.reply('that match has already started. predictions closed. your wallet is saved for next time.');
   }
 
   if (!state.predictions[matchId]) state.predictions[matchId] = { quick: {}, pro: {}, exact: {} };
@@ -1197,9 +1388,6 @@ bot.on('text', async (ctx, next) => {
     locked: true,
     entryBalanceFwc: h.balanceFwc
   };
-  u.wallet = wallet.toLowerCase();
-  u.lastSet = Date.now();
-  u.awaitingFor = null;
   saveStateNow();
 
   const mult = bagMultiplier(h.balanceFwc);
@@ -1774,13 +1962,16 @@ async function autopilotTick() {
     if (hourUtc >= VOTE_HOUR_UTC && hourUtc < VOTE_HOUR_UTC + 2) {
       await postDailyVote().catch(e => console.log('vote post err:', e.message));
     }
-    // Daily schedule: post a bit after vote
-    if (hourUtc >= VOTE_HOUR_UTC + 1 && hourUtc <= 22 && now - lastSchedulePoll > 60000) {
+    // Daily schedule: post at SCHEDULE_HOUR_UTC
+    if (hourUtc >= SCHEDULE_HOUR_UTC && hourUtc <= 22 && now - lastSchedulePoll > 60000) {
       await postDailySchedule();
       lastSchedulePoll = now;
     }
     // Close vote check
     await maybeCloseVote().catch(e => console.log('vote close err:', e.message));
+    // Auto-repost active prompts if buried
+    await maybeRepostVote().catch(e => console.log('repost vote err:', e.message));
+    await maybeRepostPrediction().catch(e => console.log('repost pred err:', e.message));
 
     // full schedule poll every 60s
     if (now - lastFullPoll > 60000) {
@@ -1849,10 +2040,25 @@ async function preWarmCheck() {
 setInterval(preWarmCheck, 30000);
 
 // ---------- Moderation handler ----------
+// counter for repost-after-N-messages
+let groupMsgCounterSinceVote = 0;
+let groupMsgCounterSincePrediction = 0;
+let cachedBotId = null;
+
 bot.on('message', async (ctx, next) => {
   try {
     if (!ctx.chat || (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup')) return next();
     if (!state.groupId) { state.groupId = ctx.chat.id; saveStateNow(); }
+
+    // bump counters for repost logic - don't count the bot's own messages
+    if (!cachedBotId) {
+      try { cachedBotId = (await bot.telegram.getMe()).id; } catch (e) {}
+    }
+    if (ctx.from && ctx.from.id !== cachedBotId) {
+      groupMsgCounterSinceVote += 1;
+      groupMsgCounterSincePrediction += 1;
+    }
+
     if (await isAdmin(ctx)) return next();
 
     const msg = ctx.message;
@@ -1915,27 +2121,55 @@ bot.command('next', async (ctx) => {
 // ---------- Admin commands ----------
 bot.command('start', async (ctx) => {
   if (ctx.chat.type === 'private') {
-    // friendly community-facing start message
-    const text = [
-      'hey ' + esc(ctx.from.first_name || 'there') + '!',
-      '',
-      'i am the FWC prediction bot. you are all set to predict now.',
-      '',
-      '<b>how to play:</b>',
-      '1. hold at least ' + fmtFwc(MIN_HOLD_FWC) + ' FWC in your wallet',
-      '2. go back to the group',
-      '3. tap a prediction button when a match is coming up',
-      '4. i will ask for your wallet here in DM',
-      '5. winners get FWC after full-time',
-      '',
-      'commands:',
-      '/mywallet - show your saved wallet',
-      '/help - all commands',
-      '',
-      '<i>tip: read the pinned instructions in the group for the full breakdown.</i>'
-    ].join('\n');
-    try { await sendHTML(ctx.chat.id, text); } catch (e) { await ctx.reply('welcome'); }
+    const userId = ctx.from.id;
+    const u = state.userWallets[userId] = state.userWallets[userId] || {};
+    u.username = ctx.from.username || ctx.from.first_name || ('user' + userId);
+
+    if (u.wallet) {
+      // already has wallet on file
+      const h = await checkFwcHolder(u.wallet);
+      const status = h.meetsGate
+        ? E.check + ' you hold <b>' + fmtFwc(h.balanceFwc) + ' FWC</b>. you can vote and predict.'
+        : E.warn + ' your wallet has <b>' + fmtFwc(h.balanceFwc) + ' FWC</b>. minimum is <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>.';
+      try {
+        await sendHTML(ctx.chat.id,
+          'hey ' + esc(ctx.from.first_name || 'there') + '! good to see you.\n\n' +
+          'your wallet on file:\n<code>' + esc(u.wallet) + '</code>\n\n' + status + '\n\n' +
+          'to change wallet, use /wallet\n' +
+          'for commands: /help');
+      } catch (e) {}
+      return;
+    }
+
+    // no wallet yet - prompt for it
+    u.awaitingFor = { type: 'register' };
+    saveStateNow();
+    try {
+      await sendHTML(ctx.chat.id,
+        'hey ' + esc(ctx.from.first_name || 'there') + '! welcome to FWC predictions.\n\n' +
+        '<b>step 1: drop your BSC wallet</b>\n' +
+        'paste a 0x... address here that holds at least <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>.\n\n' +
+        '<i>i\'ll check your bag and lock it in. one wallet per account, you can change it later with /wallet.</i>');
+    } catch (e) { try { await ctx.reply('welcome. send your 0x... wallet to get started.'); } catch (e2) {} }
   }
+});
+
+bot.command('wallet', async (ctx) => {
+  if (ctx.chat.type !== 'private') {
+    try { await ctx.deleteMessage(); } catch (e) {}
+    try {
+      await bot.telegram.sendMessage(ctx.from.id, 'run /wallet here in DM, not in the group.');
+    } catch (e) {}
+    return;
+  }
+  const userId = ctx.from.id;
+  const u = state.userWallets[userId] = state.userWallets[userId] || {};
+  u.username = ctx.from.username || ctx.from.first_name || ('user' + userId);
+  u.awaitingFor = { type: 'register' };
+  saveStateNow();
+  const current = u.wallet ? '\n\ncurrent wallet:\n<code>' + esc(u.wallet) + '</code>\n\nsending a new one will replace it.' : '';
+  await sendHTML(ctx.chat.id,
+    'paste a BSC wallet address (0x...) that holds at least <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>.' + current);
 });
 
 bot.command('help', async (ctx) => {
