@@ -22,7 +22,13 @@ const E = {
   money: '\u{1F4B0}',
   check: '\u2705',
   cross: '\u274C',
-  warn: '\u26A0\uFE0F'
+  warn: '\u26A0\uFE0F',
+  green: '\u{1F7E2}',
+  pause: '\u23F8\uFE0F',
+  play: '\u25B6\uFE0F',
+  flag: '\u{1F3C1}',
+  bell: '\u{1F514}',
+  zap: '\u26A1'
 };
 
 // ---------- Env ----------
@@ -369,14 +375,92 @@ async function fetchTodayMatches(force) {
   return matches;
 }
 
+// Track live state of each match to pick the right API
+function isLikelyLive(cached) {
+  if (!cached || !cached.data) return false;
+  const s = cached.data.status;
+  return s === 'LIVE' || s === 'IN_PLAY' || s === 'PAUSED';
+}
+
+// Convert api-football response to football-data-shaped match object
+function shapeAfMatchToFd(af, baseMatch) {
+  if (!af) return null;
+  const status = (af.fixture && af.fixture.status && af.fixture.status.short) || '';
+  let mappedStatus = 'TIMED';
+  if (status === '1H' || status === '2H' || status === 'ET' || status === 'BT' || status === 'P' || status === 'LIVE') mappedStatus = 'IN_PLAY';
+  else if (status === 'HT') mappedStatus = 'PAUSED';
+  else if (status === 'FT' || status === 'AET' || status === 'PEN') mappedStatus = 'FINISHED';
+  else if (status === 'NS' || status === 'TBD') mappedStatus = 'TIMED';
+  else if (status === 'CANC' || status === 'ABD' || status === 'PST' || status === 'AWD' || status === 'WO') mappedStatus = 'CANCELLED';
+
+  const homeName = af.teams && af.teams.home && af.teams.home.name;
+  const awayName = af.teams && af.teams.away && af.teams.away.name;
+  const homeGoals = af.goals && af.goals.home != null ? af.goals.home : 0;
+  const awayGoals = af.goals && af.goals.away != null ? af.goals.away : 0;
+  const htHome = af.score && af.score.halftime && af.score.halftime.home;
+  const htAway = af.score && af.score.halftime && af.score.halftime.away;
+  const ftHome = af.score && af.score.fulltime && af.score.fulltime.home;
+  const ftAway = af.score && af.score.fulltime && af.score.fulltime.away;
+  const minute = af.fixture && af.fixture.status && af.fixture.status.elapsed;
+
+  // build goals array from events
+  const goals = [];
+  if (af.events) {
+    for (const ev of af.events) {
+      if (ev.type === 'Goal') {
+        goals.push({
+          minute: ev.time && ev.time.elapsed,
+          extraMinute: ev.time && ev.time.extra,
+          scorer: { name: ev.player && ev.player.name },
+          team: { name: ev.team && ev.team.name }
+        });
+      }
+    }
+  }
+
+  return {
+    id: (baseMatch && baseMatch.id) || (af.fixture && af.fixture.id),
+    status: mappedStatus,
+    utcDate: (baseMatch && baseMatch.utcDate) || (af.fixture && af.fixture.date),
+    homeTeam: (baseMatch && baseMatch.homeTeam) || { name: homeName, tla: homeName && homeName.slice(0, 3).toUpperCase() },
+    awayTeam: (baseMatch && baseMatch.awayTeam) || { name: awayName, tla: awayName && awayName.slice(0, 3).toUpperCase() },
+    score: {
+      fullTime: { home: ftHome != null ? ftHome : homeGoals, away: ftAway != null ? ftAway : awayGoals },
+      halfTime: { home: htHome, away: htAway }
+    },
+    goals,
+    minute,
+    apiSource: 'af'
+  };
+}
+
 async function fetchMatchDetail(matchId, force) {
   const now = Date.now();
   const cached = matchCache[matchId];
-  // serve cache while fetching fresh
-  if (!force && cached && now - cached.at < 15000) return cached.data;
+  // shorter cache while live for faster goal detection
+  const cacheAge = isLikelyLive(cached) ? 8000 : 15000;
+  if (!force && cached && now - cached.at < cacheAge) return cached.data;
+
+  // PRIMARY: if match is likely live, use api-football for faster data
+  if (isLikelyLive(cached) && AF_KEYS.length) {
+    try {
+      const data = await afGet('/fixtures?id=' + matchId);
+      if (data && data.response && data.response[0]) {
+        const shaped = shapeAfMatchToFd(data.response[0], cached.data);
+        if (shaped) {
+          matchCache[matchId] = { data: shaped, at: now };
+          return shaped;
+        }
+      }
+    } catch (e) { console.log('af live fetch err:', e.message); }
+    // fall through to football-data if af failed
+  }
+
+  // FALLBACK / pre-match: use football-data.org
   const data = await fdGet('/matches/' + matchId);
   if (!data) return cached ? cached.data : null;
   const match = data.match || data;
+  match.apiSource = 'fd';
   matchCache[matchId] = { data: match, at: now };
   return match;
 }
@@ -696,7 +780,6 @@ const HT_LINES = [
 ];
 const FT_LINES = ['full time ' + E.party, 'final whistle ' + E.party, 'thats it. all over', 'match over'];
 const SH_LINES = ['second half. chat locked again', 'back underway', 'they are back out'];
-const PREGOAL_LINES = ['something happened... ' + E.ball, 'goal incoming ' + E.fire, 'score change detected'];
 
 // ---------- Formatting ----------
 function fmtMatchLine(m) {
@@ -726,14 +809,19 @@ function scoreLinePlain(m) {
   return teamName(m.homeTeam) + ' ' + fmtScore(m) + ' ' + teamName(m.awayTeam);
 }
 
+// Live minute: ALWAYS prefer API-reported minute. Fall back to wall-clock only if absent.
+// Cap at 90' to avoid extra-time inflation in user-facing display.
 function liveMinute(m) {
-  // real minute based on kickoff time
-  if (!m.utcDate) return null;
+  if (m && m.minute != null && m.minute > 0) {
+    return Math.min(90, m.minute);
+  }
+  // wall-clock fallback only when API doesn't give us a minute
+  if (!m || !m.utcDate) return null;
   const start = new Date(m.utcDate).getTime();
   const diff = Date.now() - start;
   if (diff < 0) return null;
   let mins = Math.floor(diff / 60000);
-  if (mins > 120) mins = 120;
+  if (mins > 90) mins = 90;
   return mins;
 }
 
@@ -778,9 +866,12 @@ async function postDailyVote() {
     return;
   }
 
-  // post instructions first if not already there
-  if (!state.instructionsMsgId) {
+  // post instructions FRESH each day so they're always above today's vote/prediction
+  // even if instructionsMsgId is set from yesterday, we re-post to put them on top
+  if (state.instructionsPostedOn !== dateKey) {
     await postInstructions(state.groupId).catch(() => {});
+    state.instructionsPostedOn = dateKey;
+    saveStateNow();
   }
 
   // SHORTCUT: only one match today - skip the vote, auto-select it
@@ -1149,19 +1240,29 @@ async function ensurePredictionForMatch(m) {
     } catch (e) { console.log('pro pred err:', e.message); }
   }
 
-  // Score range pool (hardest, cleanest)
+  // Hard pool: HT/FT prediction, 3x3 grid
   if (!state.predictionMsgs[id].exactMsgId) {
     const splitCount = state.dailyVote[getDateKey()] ? state.dailyVote[getDateKey()].selectCount : 1;
-    const exactText = '<b>' + E.trophy + E.fire + ' HARD: SCORE RANGE</b>\n\n' +
+    // Format: PR_<id>_e_<HT><FT>  where HT/FT each are H, D, or A
+    // Prefer official 3-letter TLA, fall back to first 3 letters of name
+    const homeAbbr = ((m.homeTeam && m.homeTeam.tla) || hn || 'HOM').slice(0, 3).toUpperCase();
+    const awayAbbr = ((m.awayTeam && m.awayTeam.tla) || an || 'AWY').slice(0, 3).toUpperCase();
+    const exactText = E.trophy + E.fire + ' <b>HARD: HALF/FULL TIME</b>\n\n' +
       hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af + '\n' +
-      'how many total goals in the match?\n' +
-      'pool: $' + (HARD_POOL_USD / splitCount).toFixed(2);
+      'pick who leads at half-time AND who wins at full-time\n' +
+      'pool: $' + (HARD_POOL_USD / splitCount).toFixed(2) + '\n\n' +
+      '<i>buttons: half-time result / full-time result</i>\n' +
+      '<i>' + homeAbbr + ' = ' + esc(hn) + ', ' + awayAbbr + ' = ' + esc(an) + ', DRW = draw</i>';
+    const lbl = (which) => {
+      if (which === 'H') return homeAbbr;
+      if (which === 'A') return awayAbbr;
+      return 'DRW';
+    };
+    const btn = (ht, ft) => Markup.button.callback(lbl(ht) + '/' + lbl(ft), 'PR_' + id + '_e_' + ht + ft);
     const rows = [
-      [Markup.button.callback('0 goals', 'PR_' + id + '_e_0')],
-      [Markup.button.callback('1 goal', 'PR_' + id + '_e_1')],
-      [Markup.button.callback('2 goals', 'PR_' + id + '_e_2')],
-      [Markup.button.callback('3 goals', 'PR_' + id + '_e_3')],
-      [Markup.button.callback('4+ goals', 'PR_' + id + '_e_4p')]
+      [btn('H', 'H'), btn('H', 'D'), btn('H', 'A')],
+      [btn('D', 'H'), btn('D', 'D'), btn('D', 'A')],
+      [btn('A', 'H'), btn('A', 'D'), btn('A', 'A')]
     ];
     try {
       const sent = await sendHTML(state.groupId, exactText, Markup.inlineKeyboard(rows));
@@ -1302,12 +1403,11 @@ function decodeChoice(code, pool, match) {
     const oudir = code[1] === 'O' ? 'Over 2.5' : 'Under 2.5';
     return winner + ' + ' + oudir;
   }
-  // score range pool
-  if (code === '0') return '0 goals total';
-  if (code === '1') return '1 goal total';
-  if (code === '2') return '2 goals total';
-  if (code === '3') return '3 goals total';
-  if (code === '4p') return '4 or more goals total';
+  // HARD pool: HT/FT (e.g. 'HH', 'DA', 'AH')
+  if (pool === 'exact' && code && code.length === 2) {
+    const lbl = (c) => c === 'H' ? hn : c === 'A' ? an : 'Draw';
+    return lbl(code[0]) + ' at HT / ' + lbl(code[1]) + ' at FT';
+  }
   return 'unknown';
 }
 
@@ -1424,7 +1524,7 @@ async function announceKickoff(m) {
   }
   if (state.settings.autoLock) await setGroupLocked(state.groupId, true);
   const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
-  const text = '<b>' + E.lock + ' KICKOFF</b>\n\n' +
+  const text = E.green + ' <b>KICKOFF</b> ' + E.lock + '\n\n' +
     hf + ' <b>' + esc(teamName(m.homeTeam)) + '</b> vs <b>' + esc(teamName(m.awayTeam)) + '</b> ' + af + '\n' +
     pick(KICKOFF_LINES);
   try {
@@ -1440,7 +1540,7 @@ async function announceHalftime(m) {
   const rec = state.trackedMatches[id];
   if (rec.halftimeSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
-  const text = '<b>' + E.unlock + ' HALF-TIME</b>\n\n' + scoreLine(m) + '\n' + pick(HT_LINES);
+  const text = E.pause + ' <b>HALF-TIME</b> ' + E.unlock + '\n\n' + scoreLine(m) + '\n' + pick(HT_LINES);
   try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.halftimeSent = true;
   saveStateNow();
@@ -1451,7 +1551,7 @@ async function announceSecondHalf(m) {
   const rec = state.trackedMatches[id];
   if (rec.secondHalfSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, true);
-  const text = '<b>' + E.lock + ' SECOND HALF</b>\n' + pick(SH_LINES);
+  const text = E.play + ' <b>SECOND HALF</b> ' + E.lock + '\n' + pick(SH_LINES);
   try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.secondHalfSent = true;
   saveStateNow();
@@ -1462,7 +1562,7 @@ async function announceFulltime(m, detail) {
   const rec = state.trackedMatches[id];
   if (rec.fulltimeSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
-  const lines = ['<b>' + E.unlock + ' FULL TIME ' + E.party + '</b>', '', scoreLine(m)];
+  const lines = [E.flag + ' <b>FULL TIME</b> ' + E.party + ' ' + E.unlock, '', scoreLine(m)];
   const goals = (detail && detail.goals) || m.goals || [];
   if (goals.length) {
     const home = [], away = [];
@@ -1503,13 +1603,10 @@ function pickFromArray(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function detectExactOutcome(homeScore, awayScore) {
-  const total = homeScore + awayScore;
-  if (total === 0) return '0';
-  if (total === 1) return '1';
-  if (total === 2) return '2';
-  if (total === 3) return '3';
-  return '4p'; // 4 or more
+function detectHTFTOutcome(htHome, htAway, ftHome, ftAway) {
+  const ht = htHome > htAway ? 'H' : htAway > htHome ? 'A' : 'D';
+  const ft = ftHome > ftAway ? 'H' : ftAway > ftHome ? 'A' : 'D';
+  return ht + ft;
 }
 
 async function calculateWinnersForMatch(m, detail) {
@@ -1528,7 +1625,11 @@ async function calculateWinnersForMatch(m, detail) {
   const totalGoals = homeScore + awayScore;
   const actualWinner = homeScore > awayScore ? 'H' : awayScore > homeScore ? 'A' : 'D';
   const actualOU = totalGoals > 2.5 ? 'O' : 'U';
-  const actualExact = detectExactOutcome(homeScore, awayScore);
+  // half-time score for HT/FT prediction
+  const htScore = (detail && detail.score && detail.score.halfTime) || (m.score && m.score.halfTime) || { home: 0, away: 0 };
+  const htHome = htScore.home != null ? htScore.home : 0;
+  const htAway = htScore.away != null ? htScore.away : 0;
+  const actualHTFT = detectHTFTOutcome(htHome, htAway, homeScore, awayScore);
 
   // gather correct predictions per pool
   const quickCorrect = [];
@@ -1546,7 +1647,7 @@ async function calculateWinnersForMatch(m, detail) {
   const exactCorrect = [];
   for (const userId in (state.predictions[id].exact || {})) {
     const p = state.predictions[id].exact[userId];
-    if (p.choice === actualExact) exactCorrect.push({ userId, ...p });
+    if (p.choice === actualHTFT) exactCorrect.push({ userId, ...p });
   }
 
   // pool budgets for THIS match (divide daily pool by selection count)
@@ -1601,7 +1702,7 @@ async function calculateWinnersForMatch(m, detail) {
   // post summary to group
   const lines = ['<b>' + E.trophy + ' prediction results</b>', ''];
   const outcomeStr = (actualWinner === 'H' ? teamName(m.homeTeam) : actualWinner === 'A' ? teamName(m.awayTeam) : 'Draw') +
-    ' | ' + homeScore + '-' + awayScore + ' (' + (actualOU === 'O' ? 'over' : 'under') + ', range: ' + actualExact + ')';
+    ' | ' + homeScore + '-' + awayScore + ' (' + (actualOU === 'O' ? 'over' : 'under') + ', HT: ' + htHome + '-' + htAway + ')';
   lines.push('outcome: ' + esc(outcomeStr));
   lines.push('');
   function poolLine(label, entries, correct, winners, budget) {
@@ -1614,7 +1715,7 @@ async function calculateWinnersForMatch(m, detail) {
   }
   lines.push(poolLine('easy (winner)', Object.keys(state.predictions[id].quick || {}).length, quickCorrect.length, quickWinners, easyBudget));
   lines.push(poolLine('medium (w+goals)', Object.keys(state.predictions[id].pro || {}).length, proCorrect.length, proWinners, mediumBudget));
-  lines.push(poolLine('hard (range)', Object.keys(state.predictions[id].exact || {}).length, exactCorrect.length, exactWinners, hardBudget));
+  lines.push(poolLine('hard (HT/FT)', Object.keys(state.predictions[id].exact || {}).length, exactCorrect.length, exactWinners, hardBudget));
 
   if (allWinners.length > 1) {
     lines.push('');
@@ -1842,64 +1943,54 @@ async function checkGoals(m, detail) {
   if (!state.settings.goalAlerts) return;
   const id = String(m.id);
   const rec = state.trackedMatches[id];
-  if (!rec.lastGoalIds) rec.lastGoalIds = [];
-  if (!rec.goalAt) rec.goalAt = {}; // goal key -> when we posted
+  // never post alerts after match finished
+  if (rec.fulltimeSent) return;
+  // initialize tracking
+  if (!rec.announcedScoreStates) rec.announcedScoreStates = {}; // "1-0" -> ts
+  if (!rec.announcedGoalKeys) rec.announcedGoalKeys = []; // scorer|team|minute
   const goals = (detail && detail.goals) || m.goals || [];
+  if (!goals.length) return;
   const now = Date.now();
 
-  for (const g of goals) {
-    const scorerKey = (g.scorer && g.scorer.id) || (g.scorer && g.scorer.name) || '?';
-    const teamKey = (g.team && g.team.id) || '?';
-    // primary key: scorer + team (minute can change, scorer rarely)
-    const primary = scorerKey + '|' + teamKey;
-    // if we posted this exact scorer+team combo in last 90s, skip (minute correction)
-    if (rec.goalAt[primary] && now - rec.goalAt[primary] < 90000) continue;
-    // if it's a new scorer+team, check if minute also seen (handles same player scoring twice)
-    const minuteKey = primary + '|' + (g.minute || '?');
-    if (rec.lastGoalIds.indexOf(minuteKey) !== -1) continue;
-    rec.lastGoalIds.push(minuteKey);
-    rec.goalAt[primary] = now;
+  // sort goals by minute ascending so we announce in order
+  const sorted = [...goals].sort((a, b) => (a.minute || 0) - (b.minute || 0));
 
+  // compute running score and announce each NEW goal we haven't seen
+  let runHome = 0, runAway = 0;
+  for (const g of sorted) {
+    const isHome = g.team && m.homeTeam && (g.team.id === m.homeTeam.id || g.team.name === m.homeTeam.name);
+    const isAway = g.team && m.awayTeam && (g.team.id === m.awayTeam.id || g.team.name === m.awayTeam.name);
+    if (isHome) runHome += 1;
+    else if (isAway) runAway += 1;
+
+    const scoreState = runHome + '-' + runAway;
     const scorer = (g.scorer && g.scorer.name) || 'unknown';
-    const min = (g.minute != null ? g.minute + "'" : (liveMinute(m) ? liveMinute(m) + "'" : "?'"));
+    const teamKey = (g.team && (g.team.id || g.team.name)) || '?';
+    const goalKey = scorer + '|' + teamKey + '|' + (g.minute || '?');
+
+    // dedup: have we announced THIS scoreline already? skip
+    if (rec.announcedScoreStates[scoreState]) continue;
+    // dedup: same scorer+minute already done? skip
+    if (rec.announcedGoalKeys.indexOf(goalKey) !== -1) continue;
+
+    rec.announcedScoreStates[scoreState] = now;
+    rec.announcedGoalKeys.push(goalKey);
+
+    const apiMin = g.minute;
+    const min = apiMin != null ? Math.min(90, apiMin) + "'" : (liveMinute(m) ? liveMinute(m) + "'" : "?'");
     let scoringTeam = '';
     let scoringFlag = '';
-    if (g.team && g.team.id === (m.homeTeam && m.homeTeam.id)) { scoringTeam = teamName(m.homeTeam); scoringFlag = teamFlag(m.homeTeam); }
-    else if (g.team && g.team.id === (m.awayTeam && m.awayTeam.id)) { scoringTeam = teamName(m.awayTeam); scoringFlag = teamFlag(m.awayTeam); }
+    if (isHome) { scoringTeam = teamName(m.homeTeam); scoringFlag = teamFlag(m.homeTeam); }
+    else if (isAway) { scoringTeam = teamName(m.awayTeam); scoringFlag = teamFlag(m.awayTeam); }
 
-    const text = '<b>' + pick(GOAL_OPENERS) + '</b>\n\n' +
+    // build the alert with consistent emoji opener
+    const text = E.ball + ' <b>GOAL!</b>\n\n' +
       scoringFlag + ' <b>' + esc(scorer) + '</b> <i>' + min + '</i>' +
       (scoringTeam ? '\n<i>for ' + esc(scoringTeam) + '</i>' : '') + '\n\n' +
       scoreLine(m);
     try { await sendHTML(state.groupId, text); } catch (e) {}
   }
-  // clean old goalAt entries (>5min)
-  for (const k in rec.goalAt) if (now - rec.goalAt[k] > 300000) delete rec.goalAt[k];
   saveStateNow();
-}
-
-// Score-change pre-detection: if score changed but goals array not updated yet
-async function checkScoreChange(m, detail) {
-  if (!state.settings.goalAlerts) return;
-  const id = String(m.id);
-  const rec = state.trackedMatches[id];
-  const s = fmtScoreObj(detail || m);
-  const newTotal = (s.home || 0) + (s.away || 0);
-  if (rec.lastTotalScore == null) { rec.lastTotalScore = newTotal; return; }
-  if (newTotal > rec.lastTotalScore) {
-    // score went up but checkGoals will post the proper alert if scorer is known
-    // only post a pre-goal alert if we haven't posted any goal in last 30s
-    const recentGoal = rec.goalAt && Object.values(rec.goalAt).some(t => Date.now() - t < 30000);
-    if (!recentGoal) {
-      const min = liveMinute(m);
-      const text = '<b>' + pick(PREGOAL_LINES) + '</b>\n\n' + scoreLine(detail || m) + (min ? '\n<i>' + min + "'</i>" : '');
-      try { await sendHTML(state.groupId, text); } catch (e) {}
-      // mark this as a "pre" alert so the full alert is suppressed if it arrives within 60s
-      if (!rec.goalAt) rec.goalAt = {};
-      rec.goalAt['__pre__' + newTotal] = Date.now();
-    }
-  }
-  rec.lastTotalScore = newTotal;
 }
 
 // ---------- Adaptive polling tick ----------
@@ -1922,7 +2013,6 @@ async function runMatchUpdate(m) {
     if (!rec.kickoffSent) await announceKickoff(m);
     const detail = await fetchMatchDetail(m.id);
     if (detail) {
-      await checkScoreChange(m, detail);
       await checkGoals(m, detail);
     }
     if (rec.halftimeSent && !rec.secondHalfSent) {
@@ -1939,9 +2029,12 @@ async function runMatchUpdate(m) {
   }
 
   if (status === 'FINISHED') {
-    const detail = await fetchMatchDetail(m.id, true);
-    if (detail) await checkGoals(m, detail);
-    if (!rec.fulltimeSent) await announceFulltime(m, detail);
+    // do a final fetch to catch any last goal, then announce full-time and freeze
+    if (!rec.fulltimeSent) {
+      const detail = await fetchMatchDetail(m.id, true);
+      if (detail) await checkGoals(m, detail);
+      await announceFulltime(m, detail);
+    }
     return;
   }
 }
@@ -2201,7 +2294,7 @@ function buildInstructionsText(botUsername) {
     '<b>1 hour before kickoff</b> \u2014 prediction pools open. three to choose from:',
     '   \u2022 EASY: just pick the winner',
     '   \u2022 MEDIUM: winner + over/under 2.5 goals',
-    '   \u2022 HARD: total goals (0, 1, 2, 3, 4+)',
+    '   \u2022 HARD: half-time leader / full-time winner',
     '<b>kickoff</b> \u2014 pools close, chat locks.',
     '<b>full-time</b> \u2014 correct predictors split the pool.',
     '',
