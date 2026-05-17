@@ -455,13 +455,12 @@ function shapeAfMatchToFd(af, baseMatch) {
 // Fetches /fixtures?live=all and serves all match lookups from it.
 // AF detects live status FIRST, before football-data even knows the match is live.
 //
-// Rate budget at 45s TTL: 80 calls/hour, ~960/day for 12hr live window.
-// One call serves ALL live matches simultaneously, so the cost is per-window,
-// not per-match. Safe with 10 keys (1000/day).
-// Safety guard: if key pool runs low, TTL widens to 90s to preserve budget.
+// Rate budget at 15s TTL: 240 calls/hour, ~2,880/day for 12hr live window.
+// One call serves ALL live matches simultaneously. Safe with PRO tier (7,500/day).
+// Safety guard: if key pool runs low, TTL widens to 60s to preserve budget.
 let afLiveCache = { data: [], at: 0 };
-const AF_LIVE_TTL_MS_DEFAULT = 45000;
-const AF_LIVE_TTL_MS_LOW_BUDGET = 90000;
+const AF_LIVE_TTL_MS_DEFAULT = 15000;
+const AF_LIVE_TTL_MS_LOW_BUDGET = 60000;
 
 function currentAfLiveTtl() {
   if (!AF_KEYS.length) return AF_LIVE_TTL_MS_DEFAULT;
@@ -971,8 +970,7 @@ async function postDailySchedule() {
   const lines = ['<b>' + E.ball + ' today on the pitch</b>', ''];
   for (const m of matches) lines.push(fmtMatchLine(m));
   try {
-    const sent = await sendHTML(state.groupId, lines.join('\n'));
-    await pinMessage(state.groupId, sent.message_id, true); // silent pin
+    await sendHTML(state.groupId, lines.join('\n'));
   } catch (e) {}
 }
 
@@ -1034,7 +1032,7 @@ async function postDailyVote() {
       'pools: $' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard';
     try {
       const sent = await sendHTML(state.groupId, announce);
-      await pinMessage(state.groupId, sent.message_id, false);
+      await pinMessage(state.groupId, sent.message_id, true); // silent pin
     } catch (e) { console.log('auto-select post err:', e.message); }
     return;
   }
@@ -1077,8 +1075,8 @@ async function postDailyVote() {
       selectCount,
       perMatchPool
     };
-    // pin the vote post so it's easy to find
-    await pinMessage(state.groupId, sent.message_id, false);
+    // pin the vote post (silent) so it's easy to find
+    await pinMessage(state.groupId, sent.message_id, true);
     saveStateNow();
   } catch (e) { console.log('vote post err:', e.message); }
 }
@@ -1399,8 +1397,8 @@ async function ensurePredictionForMatch(m) {
     try {
       const sent = await sendHTML(state.groupId, exactText, Markup.inlineKeyboard(rows));
       state.predictionMsgs[id].exactMsgId = sent.message_id;
-      // pin the last prediction pool message so it stays visible above buy bots
-      await pinMessage(state.groupId, sent.message_id, false);
+      // pin the last prediction pool message (silent) so it stays visible above buy bots
+      await pinMessage(state.groupId, sent.message_id, true);
     } catch (e) { console.log('exact pred err:', e.message); }
   }
   saveStateNow();
@@ -1660,8 +1658,7 @@ async function announceKickoff(m) {
     hf + ' <b>' + esc(teamName(m.homeTeam)) + '</b> vs <b>' + esc(teamName(m.awayTeam)) + '</b> ' + af + '\n' +
     pick(KICKOFF_LINES);
   try {
-    const sent = await sendHTML(state.groupId, text);
-    await pinMessage(state.groupId, sent.message_id, false);
+    await sendHTML(state.groupId, text);
   } catch (e) {}
   rec.kickoffSent = true;
   saveStateNow();
@@ -1718,8 +1715,7 @@ async function announceFulltime(m, detail) {
   lines.push('');
   lines.push(pick(FT_LINES));
   try {
-    const sent = await sendHTML(state.groupId, lines.join('\n'));
-    await pinMessage(state.groupId, sent.message_id, false); // loud pin
+    await sendHTML(state.groupId, lines.join('\n'));
   } catch (e) {}
   rec.fulltimeSent = true;
   saveStateNow();
