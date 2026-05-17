@@ -288,9 +288,26 @@ function teamName(team) {
   return team.shortName || team.name || team.tla || '?';
 }
 
+// Leagues where teams are national teams (use country flags)
+// All other leagues are club tournaments where flags would be misleading
+const NATIONAL_LEAGUES = ['WC', 'EC', 'COPA', 'AFC', 'AFCON'];
+
+function isNationalLeague() {
+  return NATIONAL_LEAGUES.indexOf((LEAGUE || '').toUpperCase()) !== -1;
+}
+
 function teamFlag(team) {
   if (!team) return '';
+  // Only show flags for national-team tournaments (World Cup, Euros, etc.)
+  if (!isNationalLeague()) return '';
   return flagFor((team.tla || '').slice(0, 2));
+}
+
+// flag + name with conditional space (no leading/trailing space when flag is empty)
+function teamLabel(team) {
+  const flag = teamFlag(team);
+  const name = teamName(team);
+  return flag ? flag + ' ' + name : name;
 }
 
 // ---------- Key rotation pool ----------
@@ -434,29 +451,147 @@ function shapeAfMatchToFd(af, baseMatch) {
   };
 }
 
+// ---------- API-Football live cache (PRIMARY live source) ----------
+// Fetches /fixtures?live=all and serves all match lookups from it.
+// AF detects live status FIRST, before football-data even knows the match is live.
+//
+// Rate budget at 45s TTL: 80 calls/hour, ~960/day for 12hr live window.
+// One call serves ALL live matches simultaneously, so the cost is per-window,
+// not per-match. Safe with 10 keys (1000/day).
+// Safety guard: if key pool runs low, TTL widens to 90s to preserve budget.
+let afLiveCache = { data: [], at: 0 };
+const AF_LIVE_TTL_MS_DEFAULT = 45000;
+const AF_LIVE_TTL_MS_LOW_BUDGET = 90000;
+
+function currentAfLiveTtl() {
+  if (!AF_KEYS.length) return AF_LIVE_TTL_MS_DEFAULT;
+  const ready = afPool.available();
+  // if less than 20% of keys are ready (e.g. 1 of 10), back off
+  if (ready < Math.max(2, Math.floor(AF_KEYS.length * 0.2))) {
+    return AF_LIVE_TTL_MS_LOW_BUDGET;
+  }
+  return AF_LIVE_TTL_MS_DEFAULT;
+}
+
+async function fetchAfLiveMatches(force) {
+  if (!AF_KEYS.length) return [];
+  const now = Date.now();
+  const ttl = currentAfLiveTtl();
+  if (!force && afLiveCache.data.length && now - afLiveCache.at < ttl) {
+    return afLiveCache.data;
+  }
+  if (!force && now - afLiveCache.at < ttl) return afLiveCache.data;
+  try {
+    const data = await afGet('/fixtures?live=all');
+    if (data && data.response) {
+      afLiveCache = { data: data.response, at: now };
+      return data.response;
+    }
+  } catch (e) { console.log('af live fetch err:', e.message); }
+  return afLiveCache.data; // serve stale if call failed
+}
+
+function normalizeTeamName(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Team name aliases: maps from variations to a canonical form.
+// When matching, we expand both APIs' names through this table.
+const TEAM_ALIASES = {
+  // Manchester
+  manunited: 'manchesterunited', manutd: 'manchesterunited', manchesterutd: 'manchesterunited',
+  manchesterunitedfc: 'manchesterunited',
+  mancity: 'manchestercity', manchestercityfc: 'manchestercity',
+  // Tottenham
+  spurs: 'tottenham', tottenhamhotspur: 'tottenham', tottenhamhotspurfc: 'tottenham',
+  // PSG / Paris
+  psg: 'parissaintgermain', parissg: 'parissaintgermain',
+  // Inter
+  inter: 'internazionale', intermilan: 'internazionale',
+  // Bayern
+  bayern: 'bayernmunich', fcbayernmunchen: 'bayernmunich', fcbayern: 'bayernmunich',
+  // Real Madrid / Barca
+  realmadridcf: 'realmadrid',
+  fcbarcelona: 'barcelona', barca: 'barcelona',
+  // Atletico
+  atleticomadrid: 'atletico', clubatleticodemadrid: 'atletico', atleti: 'atletico',
+  // Wolves
+  wolverhampton: 'wolves', wolverhamptonwanderers: 'wolves',
+  // Newcastle
+  newcastleunited: 'newcastle', newcastleunitedfc: 'newcastle', newcastleutd: 'newcastle',
+  // Brighton
+  brightonandhovealbion: 'brighton', brightonhovealbion: 'brighton',
+  // Aston Villa
+  astonvillafc: 'astonvilla',
+  // West Ham
+  westhamunited: 'westham', westhamunitedfc: 'westham',
+  // Liverpool / Chelsea / Arsenal
+  liverpoolfc: 'liverpool',
+  chelseafc: 'chelsea',
+  arsenalfc: 'arsenal',
+  // Common suffixes
+  cf: '', fc: ''
+};
+
+function canonicalTeamName(s) {
+  const n = normalizeTeamName(s);
+  if (!n) return '';
+  // Direct alias hit
+  if (TEAM_ALIASES[n]) return TEAM_ALIASES[n];
+  // Strip trailing fc/cf and try again
+  const stripped = n.replace(/(fc|cf)$/, '');
+  if (stripped !== n) {
+    if (TEAM_ALIASES[stripped]) return TEAM_ALIASES[stripped];
+    return stripped;
+  }
+  return n;
+}
+
+// Find AF fixture by home+away team names with alias support
+function findAfMatchByTeams(afMatches, homeName, awayName) {
+  if (!afMatches || !afMatches.length) return null;
+  const hN = canonicalTeamName(homeName);
+  const aN = canonicalTeamName(awayName);
+  if (!hN || !aN) return null;
+  for (const f of afMatches) {
+    const fh = canonicalTeamName(f.teams && f.teams.home && f.teams.home.name);
+    const fa = canonicalTeamName(f.teams && f.teams.away && f.teams.away.name);
+    // exact canonical match, OR bidirectional substring on canonical names
+    const homeMatch = fh === hN || fh.includes(hN) || hN.includes(fh);
+    const awayMatch = fa === aN || fa.includes(aN) || aN.includes(fa);
+    if (homeMatch && awayMatch) return f;
+  }
+  return null;
+}
+
 async function fetchMatchDetail(matchId, force) {
   const now = Date.now();
   const cached = matchCache[matchId];
-  // shorter cache while live for faster goal detection
   const cacheAge = isLikelyLive(cached) ? 8000 : 15000;
   if (!force && cached && now - cached.at < cacheAge) return cached.data;
 
-  // PRIMARY: if match is likely live, use api-football for faster data
-  if (isLikelyLive(cached) && AF_KEYS.length) {
-    try {
-      const data = await afGet('/fixtures?id=' + matchId);
-      if (data && data.response && data.response[0]) {
-        const shaped = shapeAfMatchToFd(data.response[0], cached.data);
-        if (shaped) {
-          matchCache[matchId] = { data: shaped, at: now };
-          return shaped;
-        }
+  // STEP 1: try AF live feed first. We look up the match by team names,
+  // not by ID, because FD ids != AF ids. If AF has it, AF is the source of truth.
+  // We need the team names - get them from the cached match or from FD's schedule cache.
+  let baseMatch = cached && cached.data;
+  if (!baseMatch && todayCache.data) {
+    baseMatch = todayCache.data.find(m => String(m.id) === String(matchId));
+  }
+  if (baseMatch && AF_KEYS.length) {
+    const homeName = baseMatch.homeTeam && baseMatch.homeTeam.name;
+    const awayName = baseMatch.awayTeam && baseMatch.awayTeam.name;
+    const afLive = await fetchAfLiveMatches();
+    const afMatch = findAfMatchByTeams(afLive, homeName, awayName);
+    if (afMatch) {
+      const shaped = shapeAfMatchToFd(afMatch, baseMatch);
+      if (shaped) {
+        matchCache[matchId] = { data: shaped, at: now };
+        return shaped;
       }
-    } catch (e) { console.log('af live fetch err:', e.message); }
-    // fall through to football-data if af failed
+    }
   }
 
-  // FALLBACK / pre-match: use football-data.org
+  // STEP 2: fall back to football-data.org (handles pre-match + finished states + AF gaps)
   const data = await fdGet('/matches/' + matchId);
   if (!data) return cached ? cached.data : null;
   const match = data.match || data;
@@ -465,27 +600,17 @@ async function fetchMatchDetail(matchId, force) {
   return match;
 }
 
-// api-football corroboration for live score (used only when goal suspected)
+// kept for compatibility - now uses the cached live feed
 async function afVerifyLiveScore(homeName, awayName) {
-  if (!AF_KEYS.length) return null;
-  // fetch all live fixtures, find ours
-  const data = await afGet('/fixtures?live=all');
-  if (!data || !data.response) return null;
-  const normalize = s => (s || '').toLowerCase().replace(/[^a-z]/g, '');
-  const hN = normalize(homeName), aN = normalize(awayName);
-  for (const f of data.response) {
-    const fh = normalize(f.teams && f.teams.home && f.teams.home.name);
-    const fa = normalize(f.teams && f.teams.away && f.teams.away.name);
-    if ((fh.includes(hN) || hN.includes(fh)) && (fa.includes(aN) || aN.includes(fa))) {
-      return {
-        homeScore: f.goals && f.goals.home,
-        awayScore: f.goals && f.goals.away,
-        minute: f.fixture && f.fixture.status && f.fixture.status.elapsed,
-        events: f.events || null
-      };
-    }
-  }
-  return null;
+  const afLive = await fetchAfLiveMatches();
+  const f = findAfMatchByTeams(afLive, homeName, awayName);
+  if (!f) return null;
+  return {
+    homeScore: f.goals && f.goals.home,
+    awayScore: f.goals && f.goals.away,
+    minute: f.fixture && f.fixture.status && f.fixture.status.elapsed,
+    events: f.events || null
+  };
 }
 
 // ---------- Group lock / unlock ----------
@@ -514,7 +639,13 @@ async function setGroupLocked(chatId, locked) {
 // ---------- Send + Pin helpers ----------
 async function sendHTML(chatId, text, opts) {
   const o = Object.assign({ parse_mode: 'HTML', disable_web_page_preview: true }, opts || {});
-  return bot.telegram.sendMessage(chatId, text, o);
+  // Clean up leftover double-spaces and orphan spaces from removed flags.
+  // Only collapses spaces inside lines; preserves line breaks.
+  let cleaned = String(text)
+    .split('\n')
+    .map(line => line.replace(/ {2,}/g, ' ').replace(/\s+$/g, ''))
+    .join('\n');
+  return bot.telegram.sendMessage(chatId, cleaned, o);
 }
 
 async function pinMessage(chatId, messageId, silent) {
@@ -786,7 +917,10 @@ function fmtMatchLine(m) {
   const h = m.homeTeam || {}, a = m.awayTeam || {};
   const t = new Date(m.utcDate);
   const time = String(t.getUTCHours()).padStart(2, '0') + ':' + String(t.getUTCMinutes()).padStart(2, '0');
-  return '<b>' + time + ' UTC</b>  ' + teamFlag(h) + ' ' + esc(teamName(h)) + ' vs ' + esc(teamName(a)) + ' ' + teamFlag(a);
+  const hf = teamFlag(h), af = teamFlag(a);
+  const hSide = hf ? hf + ' ' + esc(teamName(h)) : esc(teamName(h));
+  const aSide = af ? esc(teamName(a)) + ' ' + af : esc(teamName(a));
+  return '<b>' + time + ' UTC</b>  ' + hSide + ' vs ' + aSide;
 }
 
 function fmtScoreObj(m) {
@@ -906,8 +1040,7 @@ async function postDailyVote() {
   }
 
   const selectCount = howManyToSelect(upcoming.length);
-  const totalPool = EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD +
-    (state.rollover.easy + state.rollover.medium + state.rollover.hard);
+  const totalPool = EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD;
   const perMatchPool = totalPool / selectCount;
 
   const lines = [
@@ -915,8 +1048,7 @@ async function postDailyVote() {
     '',
     upcoming.length + ' matches today. pick ' + (selectCount === 1 ? 'ONE' : 'TWO favorites') + '.',
     '',
-    'today\'s pool: $' + totalPool.toFixed(2) +
-    (state.rollover.easy + state.rollover.medium + state.rollover.hard > 0 ? ' (incl. rollover)' : ''),
+    'today\'s pool: $' + totalPool.toFixed(2),
     'split: $' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard',
     selectCount === 2 ? '(divided across the 2 selected matches)' : '',
     '',
@@ -1654,17 +1786,17 @@ async function calculateWinnersForMatch(m, detail) {
   const dateKey = getDateKey();
   const v = state.dailyVote[dateKey];
   const splitCount = (v && v.selectCount) || 1;
-  // include rollover from prior days
-  const easyBudget = (EASY_POOL_USD + state.rollover.easy) / splitCount;
-  const mediumBudget = (MEDIUM_POOL_USD + state.rollover.medium) / splitCount;
-  const hardBudget = (HARD_POOL_USD + state.rollover.hard) / splitCount;
+  // Fixed daily pools - no rollover.
+  const easyBudget = EASY_POOL_USD / splitCount;
+  const mediumBudget = MEDIUM_POOL_USD / splitCount;
+  const hardBudget = HARD_POOL_USD / splitCount;
 
   // helper: split a pool budget among correct predictors, weighted by bag size
+  // Unwon money does NOT roll over - it stays in the reward wallet for future use.
   async function splitPool(correctArr, poolName, totalBudget) {
     if (totalBudget <= 0) return [];
     if (!correctArr.length) {
-      // nobody won this pool, the budget rolls over
-      state.rollover[poolName === 'quick' ? 'easy' : poolName === 'pro' ? 'medium' : 'hard'] = totalBudget;
+      // nobody won this pool - money stays in reward wallet, no rollover
       return [];
     }
     // re-verify each correct predictor still meets gate
@@ -1678,8 +1810,7 @@ async function calculateWinnersForMatch(m, detail) {
       eligible.push({ ...cand, balanceFwc: h.balanceFwc, balanceUsd: h.balanceUsd, weight: bagMultiplier(h.balanceFwc) });
     }
     if (!eligible.length) {
-      // no one eligible, rollover
-      state.rollover[poolName === 'quick' ? 'easy' : poolName === 'pro' ? 'medium' : 'hard'] = totalBudget;
+      // no one eligible - money stays in reward wallet, no rollover
       return [];
     }
     // share = (their weight / total weight) * totalBudget
@@ -1689,8 +1820,6 @@ async function calculateWinnersForMatch(m, detail) {
       if (amount > PER_WIN_CAP_USD) amount = PER_WIN_CAP_USD;
       return { ...e, amountUsd: amount, pool: poolName };
     });
-    // clear rollover for this pool since it was won
-    state.rollover[poolName === 'quick' ? 'easy' : poolName === 'pro' ? 'medium' : 'hard'] = 0;
     return shares;
   }
 
@@ -1707,8 +1836,8 @@ async function calculateWinnersForMatch(m, detail) {
   lines.push('');
   function poolLine(label, entries, correct, winners, budget) {
     let s = label + ': ' + entries + ' entries / ' + correct + ' correct';
-    if (correct === 0) s += ' (pool rolls over)';
-    else if (winners.length === 0) s += ' (no eligible holders, rolls over)';
+    if (correct === 0) s += ' (no winners)';
+    else if (winners.length === 0) s += ' (no eligible holders)';
     else if (winners.length === 1) s += ' - winner: @' + esc(winners[0].username || 'user') + ' $' + winners[0].amountUsd.toFixed(2);
     else s += ' - $' + budget.toFixed(2) + ' split ' + winners.length + ' ways';
     return s;
@@ -2002,7 +2131,44 @@ async function runMatchUpdate(m) {
   const id = String(m.id);
   if (!state.trackedMatches[id]) state.trackedMatches[id] = {};
   const rec = state.trackedMatches[id];
-  const status = m.status;
+
+  // Within the live window (kickoff +/- buffer), check AF live feed for status override.
+  // This means even if FD lags and says TIMED, if AF shows the match live, we treat it as live.
+  let status = m.status;
+  let liveSource = 'fd';
+  if (AF_KEYS.length && m.utcDate && m.homeTeam && m.awayTeam) {
+    const ko = new Date(m.utcDate).getTime();
+    const now = Date.now();
+    // window: from kickoff -10min through kickoff +3hr
+    if (now > ko - 10 * 60 * 1000 && now < ko + 3 * 60 * 60 * 1000) {
+      const afLive = await fetchAfLiveMatches();
+      const afMatch = findAfMatchByTeams(afLive, m.homeTeam.name, m.awayTeam.name);
+      if (afMatch) {
+        liveSource = 'af';
+        const afShort = afMatch.fixture && afMatch.fixture.status && afMatch.fixture.status.short;
+        if (afShort === '1H' || afShort === '2H' || afShort === 'ET' || afShort === 'BT' || afShort === 'P' || afShort === 'LIVE') {
+          status = 'IN_PLAY';
+        } else if (afShort === 'HT') {
+          status = 'PAUSED';
+        } else if (afShort === 'FT' || afShort === 'AET' || afShort === 'PEN') {
+          status = 'FINISHED';
+        }
+      }
+      // log live-source every 5 min per match for visibility
+      if (!rec.lastLiveLogAt || now - rec.lastLiveLogAt > 5 * 60 * 1000) {
+        console.log('[LIVE]', {
+          match: (m.homeTeam.name || '?') + ' vs ' + (m.awayTeam.name || '?'),
+          fdStatus: m.status,
+          afFound: !!afMatch,
+          source: liveSource,
+          afStatus: afMatch && afMatch.fixture && afMatch.fixture.status && afMatch.fixture.status.short,
+          minute: afMatch && afMatch.fixture && afMatch.fixture.status && afMatch.fixture.status.elapsed,
+          afReady: AF_KEYS.length ? afPool.available() + '/' + afPool.size() : 'none'
+        });
+        rec.lastLiveLogAt = now;
+      }
+    }
+  }
 
   if (status === 'SCHEDULED' || status === 'TIMED') {
     await ensurePollForMatch(m);
@@ -2284,27 +2450,22 @@ function buildInstructionsText(botUsername) {
   return [
     '<b>' + E.trophy + ' FWC PREDICTIONS</b>',
     '',
-    '<b>before you play (one time):</b>',
-    '\u2022 hold at least <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b> in your wallet',
-    '\u2022 tap ' + handle + ' \u2192 <b>Start</b> to open a DM with me',
+    '<b>setup (one time):</b>',
+    '1. hold <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>',
+    '2. DM ' + handle + ' \u2192 tap <b>Start</b> \u2192 send your wallet',
     '',
-    '<b>how a match day works:</b>',
-    '<b>' + VOTE_HOUR_UTC + 'am UTC</b> \u2014 if matches are on today, i post a vote in the group. you pick which match should have predictions.',
-    '<b>2 hours before kickoff</b> \u2014 vote closes, winning match announced.',
-    '<b>1 hour before kickoff</b> \u2014 prediction pools open. three to choose from:',
-    '   \u2022 EASY: just pick the winner',
-    '   \u2022 MEDIUM: winner + over/under 2.5 goals',
-    '   \u2022 HARD: half-time leader / full-time winner',
-    '<b>kickoff</b> \u2014 pools close, chat locks.',
-    '<b>full-time</b> \u2014 correct predictors split the pool.',
+    '<b>each match day:</b>',
+    '\u2022 ' + VOTE_HOUR_UTC + 'am UTC \u2014 vote on the match',
+    '\u2022 1h before kickoff \u2014 prediction pools open',
+    '\u2022 kickoff \u2014 pools close, chat locks',
+    '\u2022 full-time \u2014 winners split the pool',
     '',
-    '<b>first time picking:</b>',
-    'tap a pool button \u2192 i DM you \u2192 paste your wallet \u2192 done. saved for future matches.',
+    '<b>the 3 pools:</b>',
+    '\u2022 EASY \u2014 pick the winner',
+    '\u2022 MEDIUM \u2014 winner + over/under 2.5 goals',
+    '\u2022 HARD \u2014 half-time leader / full-time winner',
     '',
-    '<b>daily pool:</b>',
-    'easy $' + EASY_POOL_USD + ' | medium $' + MEDIUM_POOL_USD + ' | hard $' + HARD_POOL_USD,
-    'split among correct holders. bigger bag = bigger share.',
-    'nobody wins a pool? it rolls into tomorrow.',
+    '<b>daily pool:</b> $' + EASY_POOL_USD + ' / $' + MEDIUM_POOL_USD + ' / $' + HARD_POOL_USD + '. bigger bag = bigger share.',
     '',
     '<i>community token. not affiliated. dyor.</i>'
   ].join('\n');
@@ -2469,7 +2630,6 @@ bot.command('status', async (ctx) => {
     'mode: ' + (DRY_RUN ? 'DRY RUN' : 'LIVE'),
     'min hold to predict: ' + fmtFwc(MIN_HOLD_FWC) + ' FWC',
     'daily pool: $' + (EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD),
-    'rollover: easy $' + state.rollover.easy.toFixed(2) + ' / med $' + state.rollover.medium.toFixed(2) + ' / hard $' + state.rollover.hard.toFixed(2),
     'pending: ' + state.pendingRewards.filter(r => r.status === 'pending').length,
     'sent today: $' + dt.sentUSD.toFixed(2),
     'per-win cap: $' + PER_WIN_CAP_USD,
