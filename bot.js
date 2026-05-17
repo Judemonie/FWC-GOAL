@@ -2141,6 +2141,9 @@ async function runMatchUpdate(m) {
       const afMatch = findAfMatchByTeams(afLive, m.homeTeam.name, m.awayTeam.name);
       if (afMatch) {
         liveSource = 'af';
+        rec.afLastSeenLive = now;
+        // Cache the AF fixture ID so we can query it directly after match drops from live feed
+        if (afMatch.fixture && afMatch.fixture.id) rec.afFixtureId = afMatch.fixture.id;
         const afShort = afMatch.fixture && afMatch.fixture.status && afMatch.fixture.status.short;
         if (afShort === '1H' || afShort === '2H' || afShort === 'ET' || afShort === 'BT' || afShort === 'P' || afShort === 'LIVE') {
           status = 'IN_PLAY';
@@ -2149,16 +2152,42 @@ async function runMatchUpdate(m) {
         } else if (afShort === 'FT' || afShort === 'AET' || afShort === 'PEN') {
           status = 'FINISHED';
         }
+      } else if (rec.afLastSeenLive && !rec.fulltimeSent && rec.afFixtureId) {
+        // AF dropped this match from the live feed.
+        // If we saw it live before AND not yet marked finished, query AF directly
+        // by fixture ID to see if it's now FINISHED (AF removes finished matches from live feed).
+        // This catches the "match ended but FD still says IN_PLAY" lag we hit on Newcastle/West Ham.
+        try {
+          const directData = await afGet('/fixtures?id=' + rec.afFixtureId);
+          if (directData && directData.response && directData.response[0]) {
+            const directFix = directData.response[0];
+            const directShort = directFix.fixture && directFix.fixture.status && directFix.fixture.status.short;
+            if (directShort === 'FT' || directShort === 'AET' || directShort === 'PEN') {
+              // Match is done. Synthesize a finished detail from AF data so checkGoals + announceFulltime work.
+              const finishedDetail = shapeAfMatchToFd(directFix, m);
+              if (finishedDetail) {
+                liveSource = 'af-direct';
+                status = 'FINISHED';
+                matchCache[m.id] = { data: finishedDetail, at: now };
+              }
+            } else if (directShort === '1H' || directShort === '2H' || directShort === 'ET' || directShort === 'BT' || directShort === 'HT' || directShort === 'P') {
+              // Still live but missed in the global feed
+              liveSource = 'af-direct';
+              status = (directShort === 'HT') ? 'PAUSED' : 'IN_PLAY';
+              const liveDetail = shapeAfMatchToFd(directFix, m);
+              if (liveDetail) matchCache[m.id] = { data: liveDetail, at: now };
+            }
+          }
+        } catch (e) { console.log('af direct fetch err:', e.message); }
       }
       // log live-source every 5 min per match for visibility
       if (!rec.lastLiveLogAt || now - rec.lastLiveLogAt > 5 * 60 * 1000) {
         console.log('[LIVE]', {
           match: (m.homeTeam.name || '?') + ' vs ' + (m.awayTeam.name || '?'),
           fdStatus: m.status,
-          afFound: !!afMatch,
+          resolvedStatus: status,
           source: liveSource,
-          afStatus: afMatch && afMatch.fixture && afMatch.fixture.status && afMatch.fixture.status.short,
-          minute: afMatch && afMatch.fixture && afMatch.fixture.status && afMatch.fixture.status.elapsed,
+          afFound: !!afMatch,
           afReady: AF_KEYS.length ? afPool.available() + '/' + afPool.size() : 'none'
         });
         rec.lastLiveLogAt = now;
