@@ -2828,6 +2828,148 @@ bot.action(/^T_(.+)$/, async (ctx) => {
   await showSettings(ctx);
 });
 
+// ============================================================
+// WEBSITE PROXY ENDPOINTS for fifa26.website
+// Exposes WC data to the website without leaking API keys.
+// Caches aggressively - one fetch serves thousands of visitors.
+// ============================================================
+
+// CORS for fifa26.website only (lock down origin)
+const SITE_ORIGINS = new Set([
+  'https://fifa26.website',
+  'https://www.fifa26.website'
+]);
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/fwc/')) return next();
+  const origin = req.headers.origin || '';
+  if (SITE_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
+// In-memory caches (60s TTL by default, longer for static-ish endpoints)
+const proxyCache = {
+  matches: { data: null, at: 0, ttl: 60000 },     // all WC matches - 60s
+  live: { data: null, at: 0, ttl: 30000 },        // live match - 30s
+  champion: { data: null, at: 0, ttl: 300000 }    // champion - 5min
+};
+
+function cacheFresh(slot) {
+  return slot.data && (Date.now() - slot.at) < slot.ttl;
+}
+
+// Pull all WC matches via AF (the $19 plan). Falls back to FD if AF burns.
+async function proxyFetchAllMatches() {
+  // Try AF first - season 2026, league 1 (FIFA World Cup)
+  const af = await afGet('/fixtures?league=1&season=2026');
+  if (af && af.response && af.response.length) {
+    return af.response.map(f => ({
+      id: f.fixture.id,
+      utcDate: f.fixture.date,
+      status: shapeAfStatus(f.fixture.status.short),
+      stage: f.league.round,
+      venue: f.fixture.venue && (f.fixture.venue.name + (f.fixture.venue.city ? ' \u00b7 ' + f.fixture.venue.city : '')),
+      homeTeam: { name: f.teams.home.name, tla: null },
+      awayTeam: { name: f.teams.away.name, tla: null },
+      score: {
+        fullTime: { home: f.goals.home, away: f.goals.away },
+        halfTime: { home: f.score.halftime && f.score.halftime.home, away: f.score.halftime && f.score.halftime.away }
+      },
+      minute: f.fixture.status.elapsed || null
+    }));
+  }
+  // FD backup
+  const fd = await fdGet('/competitions/WC/matches');
+  if (fd && fd.matches) return fd.matches;
+  return null;
+}
+
+// Map AF status codes to website-friendly statuses (matches what loadTournamentData expects)
+function shapeAfStatus(short) {
+  if (short === '1H' || short === '2H' || short === 'ET' || short === 'BT' || short === 'P' || short === 'LIVE') return 'IN_PLAY';
+  if (short === 'HT') return 'PAUSED';
+  if (short === 'FT' || short === 'AET' || short === 'PEN') return 'FINISHED';
+  if (short === 'NS' || short === 'TBD') return 'SCHEDULED';
+  if (short === 'PST' || short === 'CANC' || short === 'SUSP') return 'POSTPONED';
+  if (short === 'AWD' || short === 'WO') return 'FINISHED';
+  return 'TIMED';
+}
+
+// GET /api/fwc/matches - all WC fixtures with live scores
+app.get('/api/fwc/matches', async (req, res) => {
+  if (cacheFresh(proxyCache.matches)) {
+    return res.json({ matches: proxyCache.matches.data, cached: true, age: Math.floor((Date.now() - proxyCache.matches.at) / 1000) });
+  }
+  const matches = await proxyFetchAllMatches();
+  if (matches) {
+    proxyCache.matches.data = matches;
+    proxyCache.matches.at = Date.now();
+    return res.json({ matches, cached: false, age: 0 });
+  }
+  // Serve stale if both APIs fail
+  if (proxyCache.matches.data) {
+    return res.json({ matches: proxyCache.matches.data, cached: true, stale: true, age: Math.floor((Date.now() - proxyCache.matches.at) / 1000) });
+  }
+  res.status(503).json({ error: 'data unavailable' });
+});
+
+// GET /api/fwc/live - only the currently live match if any
+app.get('/api/fwc/live', async (req, res) => {
+  if (cacheFresh(proxyCache.live)) {
+    return res.json({ match: proxyCache.live.data, cached: true });
+  }
+  // Reuse matches cache or fetch fresh
+  let matches = cacheFresh(proxyCache.matches) ? proxyCache.matches.data : await proxyFetchAllMatches();
+  if (matches) {
+    if (!cacheFresh(proxyCache.matches)) {
+      proxyCache.matches.data = matches;
+      proxyCache.matches.at = Date.now();
+    }
+    const live = matches.find(m => m.status === 'IN_PLAY' || m.status === 'PAUSED' || m.status === 'LIVE') || null;
+    proxyCache.live.data = live;
+    proxyCache.live.at = Date.now();
+    return res.json({ match: live, cached: false });
+  }
+  res.status(503).json({ error: 'data unavailable' });
+});
+
+// GET /api/fwc/champion - returns winner once final is decided
+app.get('/api/fwc/champion', async (req, res) => {
+  if (cacheFresh(proxyCache.champion)) {
+    return res.json({ champion: proxyCache.champion.data, cached: true });
+  }
+  let matches = cacheFresh(proxyCache.matches) ? proxyCache.matches.data : await proxyFetchAllMatches();
+  if (matches) {
+    if (!cacheFresh(proxyCache.matches)) {
+      proxyCache.matches.data = matches;
+      proxyCache.matches.at = Date.now();
+    }
+    const finalM = matches.find(m =>
+      (m.stage && /final/i.test(m.stage) && !/semi|quarter|3rd|third/i.test(m.stage)) ||
+      (m.utcDate && m.utcDate.startsWith('2026-07-19'))
+    );
+    let champion = null;
+    if (finalM && finalM.status === 'FINISHED') {
+      const hs = finalM.score && finalM.score.fullTime && finalM.score.fullTime.home;
+      const as = finalM.score && finalM.score.fullTime && finalM.score.fullTime.away;
+      if (hs != null && as != null) {
+        if (hs > as) champion = { name: finalM.homeTeam.name, opponent: finalM.awayTeam.name, score: hs + ' - ' + as };
+        else if (as > hs) champion = { name: finalM.awayTeam.name, opponent: finalM.homeTeam.name, score: as + ' - ' + hs };
+      }
+    }
+    proxyCache.champion.data = champion;
+    proxyCache.champion.at = Date.now();
+    return res.json({ champion, cached: false });
+  }
+  res.status(503).json({ error: 'data unavailable' });
+});
+
+
 // ---------- Webhook + server ----------
 app.get('/', (req, res) => res.send('ok'));
 app.get('/health', (req, res) => res.json({
