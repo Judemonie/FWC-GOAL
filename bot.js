@@ -115,7 +115,9 @@ let state = {
   rollover: { easy: 0, medium: 0, hard: 0 }, // unwon pool money carries to next day
   // batch reminder tracking
   lastBatchReminderMsgId: null,
-  lastBatchReminderAt: 0
+  lastBatchReminderAt: 0,
+  // track loud-pinned daily messages so they can be unpinned next day
+  dailyPins: []
 };
 
 // hot in-memory caches
@@ -657,6 +659,26 @@ async function pinMessage(chatId, messageId, silent) {
   } catch (err) { console.log('pin err:', err.message); return false; }
 }
 
+// Track a pin so we can unpin it later when the day changes
+function trackDailyPin(messageId) {
+  if (!messageId) return;
+  if (!state.dailyPins) state.dailyPins = [];
+  state.dailyPins.push(messageId);
+  // keep only last 20 pins tracked to avoid unbounded growth
+  if (state.dailyPins.length > 20) state.dailyPins = state.dailyPins.slice(-20);
+}
+
+// Unpin everything we tracked from previous days. Called at start of each new day.
+async function unpinPreviousDayPins() {
+  if (!state.groupId || !state.dailyPins || !state.dailyPins.length) return;
+  const toUnpin = [...state.dailyPins];
+  state.dailyPins = [];
+  saveStateNow();
+  for (const msgId of toUnpin) {
+    try { await bot.telegram.unpinChatMessage(state.groupId, msgId); } catch (e) {}
+  }
+}
+
 // ---------- BSC: provider rotation, holder check, send ----------
 const BSC_RPCS = [
   'https://bsc-dataseed1.binance.org',
@@ -962,21 +984,6 @@ function liveMinute(m) {
 }
 
 // ---------- Match flow ----------
-async function postDailySchedule() {
-  if (!state.groupId) return;
-  const today = new Date().toISOString().slice(0, 10);
-  if (state.schedulePostedFor === today) return;
-  const matches = await fetchTodayMatches(true);
-  state.schedulePostedFor = today;
-  saveStateNow();
-  if (!matches.length) return;
-  const lines = ['<b>' + E.ball + ' today on the pitch</b>', ''];
-  for (const m of matches) lines.push(fmtMatchLine(m));
-  try {
-    await sendHTML(state.groupId, lines.join('\n'));
-  } catch (e) {}
-}
-
 // ---------- Daily voting system ----------
 function getDateKey() { return new Date().toISOString().slice(0, 10); }
 
@@ -1001,8 +1008,12 @@ async function postDailyVote() {
     return;
   }
 
+  // new day starting - unpin yesterday's pinned daily messages to keep pin list tidy
+  if (state.instructionsPostedOn !== dateKey) {
+    await unpinPreviousDayPins().catch(() => {});
+  }
+
   // post instructions FRESH each day so they're always above today's vote/prediction
-  // even if instructionsMsgId is set from yesterday, we re-post to put them on top
   if (state.instructionsPostedOn !== dateKey) {
     await postInstructions(state.groupId).catch(() => {});
     state.instructionsPostedOn = dateKey;
@@ -1036,6 +1047,7 @@ async function postDailyVote() {
     try {
       const sent = await sendHTML(state.groupId, announce);
       await pinMessage(state.groupId, sent.message_id, false); // loud pin (vote)
+      trackDailyPin(sent.message_id);
     } catch (e) { console.log('auto-select post err:', e.message); }
     return;
   }
@@ -1080,6 +1092,7 @@ async function postDailyVote() {
     };
     // pin the vote post (loud) so everyone knows to vote
     await pinMessage(state.groupId, sent.message_id, false);
+    trackDailyPin(sent.message_id);
     saveStateNow();
   } catch (e) { console.log('vote post err:', e.message); }
 }
@@ -1402,6 +1415,7 @@ async function ensurePredictionForMatch(m) {
       state.predictionMsgs[id].exactMsgId = sent.message_id;
       // pin the last prediction pool message (loud) - this is your call to predict
       await pinMessage(state.groupId, sent.message_id, false);
+      trackDailyPin(sent.message_id);
     } catch (e) { console.log('exact pred err:', e.message); }
   }
   saveStateNow();
@@ -1721,6 +1735,7 @@ async function announceFulltime(m, detail) {
     const sent = await sendHTML(state.groupId, lines.join('\n'));
     // loud pin: this is the final result, everyone should see it
     await pinMessage(state.groupId, sent.message_id, false);
+    trackDailyPin(sent.message_id);
   } catch (e) {}
   rec.fulltimeSent = true;
   saveStateNow();
@@ -2368,7 +2383,6 @@ async function clearBatchReminder() {
 }
 
 let tickRunning = false;
-let lastSchedulePoll = 0;
 let lastFullPoll = 0;
 
 async function runMatchUpdate(m) {
@@ -2490,11 +2504,6 @@ async function autopilotTick() {
     // Daily vote: post at VOTE_HOUR_UTC
     if (hourUtc >= VOTE_HOUR_UTC && hourUtc < VOTE_HOUR_UTC + 2) {
       await postDailyVote().catch(e => console.log('vote post err:', e.message));
-    }
-    // Daily schedule: same hour as vote (only matters if predictions are off)
-    if (hourUtc >= VOTE_HOUR_UTC && hourUtc <= 22 && now - lastSchedulePoll > 60000) {
-      await postDailySchedule();
-      lastSchedulePoll = now;
     }
     // Close vote check
     await maybeCloseVote().catch(e => console.log('vote close err:', e.message));
