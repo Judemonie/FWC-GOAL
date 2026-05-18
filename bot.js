@@ -112,7 +112,10 @@ let state = {
   instructionsMsgId: null,
   // Voting / match selection
   dailyVote: {},        // dateStr -> { matchIds:[], votes: { userId -> matchId }, msgId, postedAt, closed, selected: [matchIds] }
-  rollover: { easy: 0, medium: 0, hard: 0 } // unwon pool money carries to next day
+  rollover: { easy: 0, medium: 0, hard: 0 }, // unwon pool money carries to next day
+  // batch reminder tracking
+  lastBatchReminderMsgId: null,
+  lastBatchReminderAt: 0
 };
 
 // hot in-memory caches
@@ -737,8 +740,8 @@ async function sendFwcReward(toAddress, amountFwc) {
   const cap = ethers.utils.parseUnits('10000000', FWC_DECIMALS); // 10M FWC absolute max
   if (amountWei.gt(cap)) throw new Error('amount exceeds safety cap');
   const tx = await contract.transfer(toAddress, amountWei, {
-    gasLimit: 100000,
-    gasPrice: ethers.utils.parseUnits('3', 'gwei')
+    gasLimit: 80000,
+    gasPrice: ethers.utils.parseUnits('0.1', 'gwei')
   });
   await tx.wait(1);
   return { dryRun: false, txHash: tx.hash, to: toAddress, amount: amountFwc };
@@ -1032,7 +1035,7 @@ async function postDailyVote() {
       'pools: $' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard';
     try {
       const sent = await sendHTML(state.groupId, announce);
-      await pinMessage(state.groupId, sent.message_id, true); // silent pin
+      await pinMessage(state.groupId, sent.message_id, false); // loud pin (vote)
     } catch (e) { console.log('auto-select post err:', e.message); }
     return;
   }
@@ -1075,8 +1078,8 @@ async function postDailyVote() {
       selectCount,
       perMatchPool
     };
-    // pin the vote post (silent) so it's easy to find
-    await pinMessage(state.groupId, sent.message_id, true);
+    // pin the vote post (loud) so everyone knows to vote
+    await pinMessage(state.groupId, sent.message_id, false);
     saveStateNow();
   } catch (e) { console.log('vote post err:', e.message); }
 }
@@ -1397,8 +1400,8 @@ async function ensurePredictionForMatch(m) {
     try {
       const sent = await sendHTML(state.groupId, exactText, Markup.inlineKeyboard(rows));
       state.predictionMsgs[id].exactMsgId = sent.message_id;
-      // pin the last prediction pool message (silent) so it stays visible above buy bots
-      await pinMessage(state.groupId, sent.message_id, true);
+      // pin the last prediction pool message (loud) - this is your call to predict
+      await pinMessage(state.groupId, sent.message_id, false);
     } catch (e) { console.log('exact pred err:', e.message); }
   }
   saveStateNow();
@@ -1715,7 +1718,9 @@ async function announceFulltime(m, detail) {
   lines.push('');
   lines.push(pick(FT_LINES));
   try {
-    await sendHTML(state.groupId, lines.join('\n'));
+    const sent = await sendHTML(state.groupId, lines.join('\n'));
+    // loud pin: this is the final result, everyone should see it
+    await pinMessage(state.groupId, sent.message_id, false);
   } catch (e) {}
   rec.fulltimeSent = true;
   saveStateNow();
@@ -1801,6 +1806,16 @@ async function calculateWinnersForMatch(m, detail) {
       const h = await checkFwcHolder(cand.wallet);
       if (!h.meetsGate) {
         console.log('skipping ' + cand.username + ' - bag ' + fmtFwc(h.balanceFwc) + ' FWC');
+        // DM the user so they understand why they didn't get rewarded
+        try {
+          const poolLabel = poolName === 'quick' ? 'easy' : poolName === 'pro' ? 'medium' : 'hard';
+          await bot.telegram.sendMessage(cand.userId,
+            E.warn + ' <b>your ' + poolLabel + ' pool prediction was correct!</b>\n\n' +
+            'but at full-time your wallet only had <b>' + fmtFwc(h.balanceFwc) + ' FWC</b>.\n' +
+            'the minimum to receive rewards is <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>.\n\n' +
+            'keep your bag above the minimum on match days to qualify next time.',
+            { parse_mode: 'HTML' });
+        } catch (e) {}
         continue;
       }
       eligible.push({ ...cand, balanceFwc: h.balanceFwc, balanceUsd: h.balanceUsd, weight: bagMultiplier(h.balanceFwc) });
@@ -1853,7 +1868,7 @@ async function calculateWinnersForMatch(m, detail) {
   }
   if (allWinners.length) {
     lines.push('');
-    lines.push('<i>rewards pending owner review</i>');
+    lines.push('<i>rewards under review.</i>');
   }
   try { await sendHTML(state.groupId, lines.join('\n')); } catch (e) {}
 
@@ -1954,25 +1969,138 @@ bot.action('BATCH_REJECT_ALL', async (ctx) => {
 bot.action('BATCH_EDIT', async (ctx) => {
   if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
   await ctx.answerCbQuery();
-  // list with per-item reject buttons
-  const pending = state.pendingRewards.filter(r => r.status === 'pending');
-  if (!pending.length) return;
-  const rows = pending.map((r, i) => ([
-    Markup.button.callback(E.cross + ' #' + (i + 1) + ' ' + (r.username || 'user'), 'REJ_' + (state.pendingRewards.indexOf(r)))
-  ]));
+  await renderEditBatchView(ctx);
+});
+
+async function renderEditBatchView(ctx) {
+  const pending = state.pendingRewards.filter(r => r.status === 'pending' || r.status === 'on_hold');
+  if (!pending.length) {
+    try { await ctx.editMessageText('no pending rewards left.'); } catch (e) {}
+    return;
+  }
+
+  // text body shows current state of each item
+  const lines = [E.money + ' <b>edit reward batch</b>', ''];
+  pending.forEach((r, i) => {
+    const idx = state.pendingRewards.indexOf(r);
+    const poolLabel = r.pool === 'quick' ? 'easy' : r.pool === 'pro' ? 'medium' : 'hard';
+    const tag = r.status === 'on_hold' ? ' [ON HOLD]' : '';
+    lines.push('<b>#' + (i + 1) + '</b> @' + esc(r.username || 'user') + tag);
+    lines.push('  ' + poolLabel + ' pool, match: ' + esc((r.matchLabel || '').slice(0, 40)));
+    lines.push('  pays: ' + r.amountFWC.toFixed(2) + ' FWC ($' + r.amountUSD.toFixed(2) + ')');
+    lines.push('');
+  });
+  lines.push('<i>tap a number to edit, then choose action.</i>');
+
+  // build keyboard: one row per item with item number, then global actions
+  const rows = [];
+  // chunk per-item buttons 3 per row
+  let chunk = [];
+  pending.forEach((r, i) => {
+    const idx = state.pendingRewards.indexOf(r);
+    chunk.push(Markup.button.callback('#' + (i + 1), 'EDIT_ITEM_' + idx));
+    if (chunk.length === 3) { rows.push(chunk); chunk = []; }
+  });
+  if (chunk.length) rows.push(chunk);
   rows.push([Markup.button.callback(E.check + ' approve remaining', 'BATCH_APPROVE_ALL')]);
+  rows.push([Markup.button.callback(E.cross + ' cancel edits', 'BATCH_EDIT_DONE')]);
+
   try {
-    await ctx.editMessageReplyMarkup({ inline_keyboard: rows.map(r => r.map(b => b)) });
+    await ctx.editMessageText(lines.join('\n'), { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
   } catch (e) {}
+}
+
+// tap on an item -> show item actions
+bot.action(/^EDIT_ITEM_(\d+)$/, async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
+  const idx = parseInt(ctx.match[1], 10);
+  const r = state.pendingRewards[idx];
+  if (!r) return ctx.answerCbQuery('not found');
+  await ctx.answerCbQuery();
+  const poolLabel = r.pool === 'quick' ? 'easy' : r.pool === 'pro' ? 'medium' : 'hard';
+  const text = E.money + ' <b>editing reward</b>\n\n' +
+    'user: @' + esc(r.username || 'user') + '\n' +
+    'wallet: <code>' + esc(r.wallet) + '</code>\n' +
+    'pool: ' + poolLabel + '\n' +
+    'match: ' + esc(r.matchLabel || '?') + '\n' +
+    'current: <b>' + r.amountFWC.toFixed(2) + ' FWC</b> ($' + r.amountUSD.toFixed(2) + ')\n' +
+    'status: <b>' + r.status + '</b>\n\n' +
+    '<i>pick an action:</i>';
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback('half (50%)', 'ADJ_' + idx + '_50'), Markup.button.callback('double (200%)', 'ADJ_' + idx + '_200')],
+    [Markup.button.callback('+25%', 'ADJ_' + idx + '_125'), Markup.button.callback('-25%', 'ADJ_' + idx + '_75')],
+    [Markup.button.callback(r.status === 'on_hold' ? 'resume' : 'put on hold', 'HOLD_' + idx)],
+    [Markup.button.callback(E.cross + ' reject this one', 'REJ_' + idx)],
+    [Markup.button.callback('< back to batch', 'EDIT_BACK')]
+  ]);
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb.reply_markup });
+  } catch (e) {}
+});
+
+// adjust amount by percentage
+bot.action(/^ADJ_(\d+)_(\d+)$/, async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
+  const idx = parseInt(ctx.match[1], 10);
+  const pct = parseInt(ctx.match[2], 10);
+  const r = state.pendingRewards[idx];
+  if (!r) return ctx.answerCbQuery('not found');
+  const oldUsd = r.amountUSD;
+  const oldFwc = r.amountFWC;
+  r.amountUSD = +(oldUsd * pct / 100).toFixed(2);
+  r.amountFWC = +(oldFwc * pct / 100).toFixed(2);
+  // enforce per-win cap
+  if (r.amountUSD > PER_WIN_CAP_USD) {
+    r.amountUSD = PER_WIN_CAP_USD;
+    r.amountFWC = +(oldFwc * PER_WIN_CAP_USD / oldUsd).toFixed(2);
+  }
+  saveStateNow();
+  await ctx.answerCbQuery('adjusted to ' + r.amountFWC.toFixed(0) + ' FWC');
+  await renderEditBatchView(ctx);
+});
+
+// toggle hold status
+bot.action(/^HOLD_(\d+)$/, async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
+  const idx = parseInt(ctx.match[1], 10);
+  const r = state.pendingRewards[idx];
+  if (!r) return ctx.answerCbQuery('not found');
+  r.status = r.status === 'on_hold' ? 'pending' : 'on_hold';
+  saveStateNow();
+  await ctx.answerCbQuery(r.status === 'on_hold' ? 'put on hold' : 'resumed');
+  await renderEditBatchView(ctx);
+});
+
+bot.action('EDIT_BACK', async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
+  await ctx.answerCbQuery();
+  await renderEditBatchView(ctx);
+});
+
+bot.action('BATCH_EDIT_DONE', async (ctx) => {
+  if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
+  await ctx.answerCbQuery('edits saved');
+  try { await ctx.editMessageText('edits saved. send /sendbatch again to approve, or wait for reminder.'); } catch (e) {}
 });
 
 bot.action(/^REJ_(\d+)$/, async (ctx) => {
   if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery('only owner');
   const idx = parseInt(ctx.match[1], 10);
   if (state.pendingRewards[idx]) {
-    state.pendingRewards[idx].status = 'rejected';
+    const r = state.pendingRewards[idx];
+    r.status = 'rejected';
     saveStateNow();
     await ctx.answerCbQuery('rejected #' + (idx + 1));
+    // DM the user explaining their reward was rejected by admin
+    try {
+      await bot.telegram.sendMessage(r.userId,
+        E.warn + ' <b>your reward was not processed</b>\n\n' +
+        'match: ' + esc(r.matchLabel || '?') + '\n' +
+        'an admin reviewed the batch and removed your entry.\n\n' +
+        '<i>this is rare. if you think it was a mistake, dm the admin.</i>',
+        { parse_mode: 'HTML' });
+    } catch (e) {}
+    await renderEditBatchView(ctx);
   } else {
     await ctx.answerCbQuery('not found');
   }
@@ -1997,13 +2125,32 @@ async function processApprovedBatch(ctx) {
       if (r.amountUSD > PER_WIN_CAP_USD) {
         r.status = 'rejected_cap';
         results.push('per-win cap reject ' + (r.username || 'user'));
+        // DM the user explaining
+        try {
+          await bot.telegram.sendMessage(r.userId,
+            E.warn + ' <b>reward not sent</b>\n\n' +
+            'match: ' + esc(r.matchLabel || '?') + '\n' +
+            'reason: your calculated share ($' + r.amountUSD.toFixed(2) + ') exceeded the per-win cap ($' + PER_WIN_CAP_USD + ').\n\n' +
+            '<i>this is a safety limit. dm the admin if you have questions.</i>',
+            { parse_mode: 'HTML' });
+        } catch (e) {}
         continue;
       }
       // belt-and-suspenders: re-verify holder one more time before send
       const hCheck = await checkFwcHolder(r.wallet);
       if (!hCheck.meetsGate) {
         r.status = 'rejected_no_hold';
-        results.push('no longer holding ' + (r.username || 'user') + ' ($' + hCheck.balanceUsd.toFixed(2) + ')');
+        results.push('no longer holding ' + (r.username || 'user') + ' (' + fmtFwc(hCheck.balanceFwc) + ' FWC)');
+        // DM the user explaining
+        try {
+          await bot.telegram.sendMessage(r.userId,
+            E.warn + ' <b>reward not sent</b>\n\n' +
+            'match: ' + esc(r.matchLabel || '?') + '\n' +
+            'you predicted correctly but at payout time your wallet had only <b>' + fmtFwc(hCheck.balanceFwc) + ' FWC</b>.\n' +
+            'the minimum to receive rewards is <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>.\n\n' +
+            'keep your bag above the minimum on match days to qualify for rewards.',
+            { parse_mode: 'HTML' });
+        } catch (e) {}
         continue;
       }
       const sendRes = await sendFwcReward(r.wallet, r.amountFWC);
@@ -2038,6 +2185,8 @@ async function processApprovedBatch(ctx) {
     }
   }
   state.pendingRewards = state.pendingRewards.filter(r => r.status === 'pending');
+  // clear the standing reminder since batch was processed
+  await clearBatchReminder();
   saveStateNow();
 
   // owner gets full batch summary in DM
@@ -2073,9 +2222,54 @@ async function checkGoals(m, detail) {
   // initialize tracking
   if (!rec.announcedScoreStates) rec.announcedScoreStates = {}; // "1-0" -> ts
   if (!rec.announcedGoalKeys) rec.announcedGoalKeys = []; // scorer|team|minute
+  if (!rec.announcedGoalMsgs) rec.announcedGoalMsgs = {}; // goalKey -> { messageId, scoreState }
+  // skip VAR consistency until we have 2+ polls confirming, to avoid false deletes from flaky API
+  if (!rec.goalDisallowCheck) rec.goalDisallowCheck = {}; // goalKey -> consecutive missing count
+
   const goals = (detail && detail.goals) || m.goals || [];
-  if (!goals.length) return;
   const now = Date.now();
+
+  // build set of current goal keys from this poll
+  const currentGoalKeys = new Set();
+  for (const g of goals) {
+    const scorer = (g.scorer && g.scorer.name) || 'unknown';
+    const teamKey = (g.team && (g.team.id || g.team.name)) || '?';
+    currentGoalKeys.add(scorer + '|' + teamKey + '|' + (g.minute || '?'));
+  }
+
+  // VAR check: any previously-announced goal that's NO LONGER in current goals?
+  // Require 2 consecutive polls showing it missing before we treat as disallowed (avoids flaky data).
+  for (const announcedKey of rec.announcedGoalKeys) {
+    if (currentGoalKeys.has(announcedKey)) {
+      // goal still there, reset disallow counter
+      rec.goalDisallowCheck[announcedKey] = 0;
+      continue;
+    }
+    rec.goalDisallowCheck[announcedKey] = (rec.goalDisallowCheck[announcedKey] || 0) + 1;
+    // Need 2 confirmations + we must have the message ID to act on it
+    if (rec.goalDisallowCheck[announcedKey] >= 2 && rec.announcedGoalMsgs[announcedKey]) {
+      const info = rec.announcedGoalMsgs[announcedKey];
+      // delete original goal message
+      try { await bot.telegram.deleteMessage(state.groupId, info.messageId); } catch (e) {}
+      // post a brief disallowed notice
+      try {
+        const parts = announcedKey.split('|');
+        const who = parts[0] || 'goal';
+        const min = parts[2] || '?';
+        await sendHTML(state.groupId,
+          E.cross + ' <b>GOAL DISALLOWED</b>\n\n' +
+          'previous goal (' + esc(who) + ' ' + esc(min) + "') has been chalked off after review.\n" +
+          'current score: <b>' + fmtScore(m) + '</b>');
+      } catch (e) {}
+      // roll back tracking for this goal so future score states work
+      if (info.scoreState) delete rec.announcedScoreStates[info.scoreState];
+      delete rec.announcedGoalMsgs[announcedKey];
+      delete rec.goalDisallowCheck[announcedKey];
+      rec.announcedGoalKeys = rec.announcedGoalKeys.filter(k => k !== announcedKey);
+    }
+  }
+
+  if (!goals.length) { saveStateNow(); return; }
 
   // sort goals by minute ascending so we announce in order
   const sorted = [...goals].sort((a, b) => (a.minute || 0) - (b.minute || 0));
@@ -2113,12 +2307,66 @@ async function checkGoals(m, detail) {
       scoringFlag + ' <b>' + esc(scorer) + '</b> <i>' + min + '</i>' +
       (scoringTeam ? '\n<i>for ' + esc(scoringTeam) + '</i>' : '') + '\n\n' +
       scoreLine(m);
-    try { await sendHTML(state.groupId, text); } catch (e) {}
+    try {
+      const sent = await sendHTML(state.groupId, text);
+      // track message id so we can delete if VAR disallows
+      rec.announcedGoalMsgs[goalKey] = { messageId: sent.message_id, scoreState };
+    } catch (e) {}
   }
   saveStateNow();
 }
 
 // ---------- Adaptive polling tick ----------
+// ---------- Batch reminder DMs ----------
+// Sends owner a DM reminder when there are pending rewards >= 30 min after last match ended.
+// Each new reminder deletes the previous one so the chat doesn't fill with reminders.
+async function maybeRemindOwnerOfBatch() {
+  if (!OWNER_ID) return;
+  const pending = state.pendingRewards.filter(r => r.status === 'pending');
+  if (!pending.length) return;
+
+  // find most recent createdAt among pending
+  const latestCreated = Math.max(...pending.map(r => r.createdAt || 0));
+  const now = Date.now();
+  // wait at least 30 min after the last winner was queued
+  if (now - latestCreated < 30 * 60 * 1000) return;
+
+  // re-remind every 60 min
+  if (state.lastBatchReminderAt && now - state.lastBatchReminderAt < 60 * 60 * 1000) return;
+
+  // delete previous reminder if we have it
+  if (state.lastBatchReminderMsgId) {
+    try { await bot.telegram.deleteMessage(OWNER_ID, state.lastBatchReminderMsgId); } catch (e) {}
+    state.lastBatchReminderMsgId = null;
+  }
+
+  // build reminder
+  let totalUsd = 0, totalFwc = 0;
+  for (const r of pending) {
+    totalUsd += r.amountUSD || 0;
+    totalFwc += r.amountFWC || 0;
+  }
+  const text = E.bell + ' <b>reward batch waiting</b>\n\n' +
+    pending.length + ' winner' + (pending.length > 1 ? 's' : '') + ' queued\n' +
+    'total: ' + totalFwc.toFixed(2) + ' FWC ($' + totalUsd.toFixed(2) + ')\n\n' +
+    'DM <code>/sendbatch</code> to review and approve.';
+  try {
+    const sent = await bot.telegram.sendMessage(OWNER_ID, text, { parse_mode: 'HTML' });
+    state.lastBatchReminderMsgId = sent.message_id;
+    state.lastBatchReminderAt = now;
+    saveStateNow();
+  } catch (e) { console.log('batch reminder send err:', e.message); }
+}
+
+// Clear reminder state when batch is processed (called from processApprovedBatch)
+async function clearBatchReminder() {
+  if (state.lastBatchReminderMsgId && OWNER_ID) {
+    try { await bot.telegram.deleteMessage(OWNER_ID, state.lastBatchReminderMsgId); } catch (e) {}
+  }
+  state.lastBatchReminderMsgId = null;
+  state.lastBatchReminderAt = 0;
+}
+
 let tickRunning = false;
 let lastSchedulePoll = 0;
 let lastFullPoll = 0;
@@ -2253,6 +2501,8 @@ async function autopilotTick() {
     // Auto-repost active prompts if buried
     await maybeRepostVote().catch(e => console.log('repost vote err:', e.message));
     await maybeRepostPrediction().catch(e => console.log('repost pred err:', e.message));
+    // Owner reminder DMs for unpaid batches
+    await maybeRemindOwnerOfBatch().catch(e => console.log('batch remind err:', e.message));
 
     // full schedule poll every 60s
     if (now - lastFullPoll > 60000) {
