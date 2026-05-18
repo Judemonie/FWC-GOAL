@@ -426,15 +426,29 @@ function shapeAfMatchToFd(af, baseMatch) {
   const minute = af.fixture && af.fixture.status && af.fixture.status.elapsed;
 
   // build goals array from events
+  // Critical: must determine if scoring team is home or away on the AF fixture,
+  // then attach the FD-style team object so downstream code matches correctly.
   const goals = [];
+  const afHomeNorm = canonicalTeamName(homeName || '');
+  const afAwayNorm = canonicalTeamName(awayName || '');
   if (af.events) {
     for (const ev of af.events) {
       if (ev.type === 'Goal') {
+        const evTeamNorm = canonicalTeamName((ev.team && ev.team.name) || '');
+        let attachedTeam = null;
+        if (evTeamNorm === afHomeNorm) {
+          attachedTeam = (baseMatch && baseMatch.homeTeam) || { id: af.teams && af.teams.home && af.teams.home.id, name: homeName };
+        } else if (evTeamNorm === afAwayNorm) {
+          attachedTeam = (baseMatch && baseMatch.awayTeam) || { id: af.teams && af.teams.away && af.teams.away.id, name: awayName };
+        } else {
+          // fallback: raw AF team
+          attachedTeam = { name: ev.team && ev.team.name, id: ev.team && ev.team.id };
+        }
         goals.push({
           minute: ev.time && ev.time.elapsed,
           extraMinute: ev.time && ev.time.extra,
           scorer: { name: ev.player && ev.player.name },
-          team: { name: ev.team && ev.team.name }
+          team: attachedTeam
         });
       }
     }
