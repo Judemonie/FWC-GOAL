@@ -2789,8 +2789,11 @@ async function maybeRepostBoards() {
     const m = matches.find(x => String(x.id) === matchId);
     if (!m) continue;
 
+    // defensive: skip if board shapes are missing (state migration safety)
+    if (!rec.boards.goals || !rec.boards.cards || !rec.boards.subs) continue;
+
     // current score from goals board state
-    const goalsEv = rec.boards.goals.events || [];
+    const goalsEv = (rec.boards.goals && rec.boards.goals.events) || [];
     let cs = { home: 0, away: 0 };
     for (const ev of goalsEv) {
       if (ev.isHome) cs.home += 1;
@@ -2799,7 +2802,7 @@ async function maybeRepostBoards() {
 
     for (const key of ['goals', 'cards', 'subs']) {
       const board = rec.boards[key];
-      if (!board || !board.msgId || !board.events.length) continue;
+      if (!board || !board.msgId || !board.events || !board.events.length) continue;
       const since = counter - (board.messageCounterAtPost || 0);
       if (since < REPOST_AFTER_MSGS) continue;
       // rebuild
@@ -3448,84 +3451,102 @@ bot.command('mywallet', async (ctx) => {
 // Replays a finished match in fast-forward without touching real state or locking the group
 bot.command('test_match', async (ctx) => {
   if (!await isAdmin(ctx)) return;
-  const args = ctx.message.text.split(' ').slice(1);
   const groupId = ctx.chat.id;
 
-  // sample match data - real 2022 World Cup Final Argentina vs France
+  // sample match - using AF-style data shape so the real functions work as in production
+  const TEST_ID = 'TEST_DEMO_' + Date.now(); // unique per run so dedup keys are fresh
   const sampleMatch = {
-    id: 'TEST_DEMO',
+    id: TEST_ID,
     utcDate: new Date(Date.now() - 60000).toISOString(),
-    homeTeam: { id: 1, name: 'Argentina', shortName: 'Argentina', tla: 'ARG' },
-    awayTeam: { id: 2, name: 'France', shortName: 'France', tla: 'FRA' }
+    homeTeam: { id: 'home_test', name: 'Argentina', shortName: 'Argentina', tla: 'ARG' },
+    awayTeam: { id: 'away_test', name: 'France', shortName: 'France', tla: 'FRA' }
   };
+
+  // event sequence (compressed timeline)
   const sampleGoals = [
-    { minute: 23, scorer: { name: 'Lionel Messi' }, team: { id: 1 } },
-    { minute: 36, scorer: { name: 'Angel Di Maria' }, team: { id: 1 } },
-    { minute: 80, scorer: { name: 'Kylian Mbappe' }, team: { id: 2 } },
-    { minute: 81, scorer: { name: 'Kylian Mbappe' }, team: { id: 2 } },
-    { minute: 108, scorer: { name: 'Lionel Messi' }, team: { id: 1 } },
-    { minute: 118, scorer: { name: 'Kylian Mbappe' }, team: { id: 2 } }
+    { minute: 23, scorer: { name: 'Lionel Messi' }, team: sampleMatch.homeTeam },
+    { minute: 36, scorer: { name: 'Angel Di Maria' }, team: sampleMatch.homeTeam },
+    { minute: 80, scorer: { name: 'Kylian Mbappe' }, team: sampleMatch.awayTeam },
+    { minute: 81, scorer: { name: 'Kylian Mbappe' }, team: sampleMatch.awayTeam },
+    { minute: 108, scorer: { name: 'Lionel Messi' }, team: sampleMatch.homeTeam },
+    { minute: 118, scorer: { name: 'Kylian Mbappe' }, team: sampleMatch.awayTeam }
+  ];
+  // AF-style events: cards and subs
+  const sampleEvents = [
+    { type: 'Card', detail: 'Yellow Card', time: { elapsed: 34 }, player: { name: 'Rodrigo De Paul' }, team: { name: 'Argentina' } },
+    { type: 'subst', detail: 'Substitution 1', time: { elapsed: 41 }, player: { name: 'Ousmane Dembele' }, assist: { name: 'Randal Kolo Muani' }, team: { name: 'France' } },
+    { type: 'Card', detail: 'Yellow Card', time: { elapsed: 58 }, player: { name: 'Marcus Thuram' }, team: { name: 'France' } },
+    { type: 'subst', detail: 'Substitution 1', time: { elapsed: 64 }, player: { name: 'Lautaro Martinez' }, assist: { name: 'Angel Di Maria' }, team: { name: 'Argentina' } },
+    { type: 'Card', detail: 'Red Card', time: { elapsed: 110 }, player: { name: 'Nahuel Molina' }, team: { name: 'Argentina' } }
   ];
 
-  await ctx.reply('simulation starting (no group lock, no state writes)');
+  await ctx.reply('simulation starting. uses current production code paths. test match id: ' + TEST_ID);
+
+  // make sure goal alerts and predictions toggles allow events through
+  const origGoalAlerts = state.settings.goalAlerts;
+  state.settings.goalAlerts = true;
+  // remember original group so real functions target this chat
+  const origGroupId = state.groupId;
+  state.groupId = groupId;
+
+  // initialize tracked match (mimics real flow)
+  state.trackedMatches[TEST_ID] = { afFixtureId: 'test_af' };
+  // ensure tick-style updates produce the same outputs as live
 
   const delay = (ms) => new Promise(r => setTimeout(r, ms));
-  const hf = teamFlag(sampleMatch.homeTeam), af = teamFlag(sampleMatch.awayTeam);
-  const hn = teamName(sampleMatch.homeTeam), an = teamName(sampleMatch.awayTeam);
 
-  // schedule preview (silent pin would happen here in real flow)
+  // 1. KICKOFF
   await delay(1500);
-  await sendHTML(groupId, '<b>' + E.ball + ' coming up</b>\n\n' + hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af);
+  await announceKickoff(sampleMatch);
 
-  // kickoff
-  await delay(2500);
-  await sendHTML(groupId,
-    '<b>' + E.lock + ' KICKOFF</b>\n\n' +
-    hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af + '\n' +
-    pick(KICKOFF_LINES));
-
-  // goals (compressed timing)
+  // 2. Goals + cards/subs in sequence
   let runningHome = 0, runningAway = 0;
   for (let i = 0; i < sampleGoals.length; i++) {
     const g = sampleGoals[i];
-    if (g.team.id === 1) runningHome++; else runningAway++;
+    if (g.team.id === sampleMatch.homeTeam.id) runningHome++; else runningAway++;
 
-    // halftime check at minute 45+
+    // halftime simulation at first goal after minute 45
     if (g.minute > 45 && i > 0 && sampleGoals[i - 1].minute <= 45) {
-      await delay(3000);
-      await sendHTML(groupId, '<b>' + E.unlock + ' HALF-TIME</b>\n\n' +
-        esc(hn) + '  <b>' + runningHome + ' - ' + runningAway + '</b>  ' + esc(an) + '\n' +
-        pick(HT_LINES));
       await delay(2500);
-      await sendHTML(groupId, '<b>' + E.lock + ' SECOND HALF</b>\n' + pick(SH_LINES));
+      // synth a half-time-ish match state for the announce
+      const htMatch = { ...sampleMatch, score: { halfTime: { home: runningHome, away: runningAway } } };
+      await announceHalftime(htMatch);
+      await delay(2000);
+      await announceSecondHalf(htMatch);
     }
 
     await delay(3500);
-    const scoringTeam = g.team.id === 1 ? hn : an;
-    const scoringFlag = g.team.id === 1 ? hf : af;
-    await sendHTML(groupId,
-      '<b>' + pick(GOAL_OPENERS) + '</b>\n\n' +
-      scoringFlag + ' <b>' + esc(g.scorer.name) + '</b> <i>' + g.minute + "'</i>\n" +
-      '<i>for ' + esc(scoringTeam) + '</i>\n\n' +
-      esc(hn) + '  <b>' + runningHome + ' - ' + runningAway + '</b>  ' + esc(an));
+    // Pass a synthesized "detail" object so checkGoals updates the goals BOARD
+    const detail = {
+      goals: sampleGoals.slice(0, i + 1).map(x => ({
+        minute: x.minute,
+        scorer: x.scorer,
+        team: x.team
+      })),
+      _afEvents: sampleEvents.filter(e => (e.time && e.time.elapsed) <= g.minute)
+    };
+    await checkGoals(sampleMatch, detail);
+    await checkCardsAndSubs(sampleMatch, detail);
   }
 
-  // fulltime
+  // 3. FULL-TIME
   await delay(3000);
-  const home = [], away = [];
-  for (const g of sampleGoals) {
-    const line = esc(g.scorer.name) + ' <i>' + g.minute + "'</i>";
-    if (g.team.id === 1) home.push(line); else away.push(line);
-  }
-  await sendHTML(groupId,
-    '<b>' + E.unlock + ' FULL TIME ' + E.party + '</b>\n\n' +
-    esc(hn) + '  <b>' + runningHome + ' - ' + runningAway + '</b>  ' + esc(an) + '\n\n' +
-    '<b>' + esc(hn) + '</b>\n' + home.join(', ') + '\n\n' +
-    '<b>' + esc(an) + '</b>\n' + away.join(', ') + '\n\n' +
-    pick(FT_LINES));
+  const ftDetail = {
+    goals: sampleGoals.map(x => ({ minute: x.minute, scorer: x.scorer, team: x.team })),
+    score: { halfTime: { home: 2, away: 0 }, fullTime: { home: runningHome, away: runningAway } }
+  };
+  await announceFulltime(sampleMatch, ftDetail);
 
+  // 4. Clean up so the test doesn't leave artifacts
   await delay(1500);
-  await ctx.reply('simulation done. no state was modified. no api calls used.');
+  // restore settings
+  state.settings.goalAlerts = origGoalAlerts;
+  // delete the synthetic match from state (keep group as user set it)
+  delete state.trackedMatches[TEST_ID];
+  state.groupId = origGroupId;
+  saveStateNow();
+
+  await ctx.reply('simulation done. test match state cleaned up.');
 });
 
 async function showSettings(ctx) {
