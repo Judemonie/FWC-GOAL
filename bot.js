@@ -1074,6 +1074,11 @@ async function postDailyVote() {
   const dateKey = getDateKey();
   if (state.dailyVote[dateKey]) return; // already posted today
 
+  // CRITICAL: set sentinel placeholder synchronously BEFORE any await,
+  // so concurrent calls (from rapid ticks or restart races) bail at the check above.
+  state.dailyVote[dateKey] = { matchIds: [], votes: {}, closed: false, selected: [], _placeholder: true };
+  await saveStateNow();
+
   const matches = await fetchTodayMatches(true);
   // only future matches
   const now = Date.now();
@@ -1089,11 +1094,14 @@ async function postDailyVote() {
     await unpinPreviousDayPins().catch(() => {});
   }
 
-  // post instructions FRESH each day so they're always above today's vote/prediction
+  // post instructions FRESH each day so they're always above today's vote/prediction.
+  // Guard with both date AND msgId to avoid double-post on restart races.
   if (state.instructionsPostedOn !== dateKey) {
-    await postInstructions(state.groupId).catch(() => {});
+    // mark BEFORE the await so any racing call bails
     state.instructionsPostedOn = dateKey;
-    saveStateNow();
+    await saveStateNow();
+    await postInstructions(state.groupId).catch(() => {});
+    await saveStateNow();
   }
 
   // SHORTCUT: only one match today - skip the vote, auto-select it
@@ -1126,7 +1134,12 @@ async function postDailyVote() {
       const sent = await sendHTML(state.groupId, announce);
       await pinMessage(state.groupId, sent.message_id, false); // loud pin (vote)
       trackDailyPin(sent.message_id);
-    } catch (e) { console.log('auto-select post err:', e.message); }
+    } catch (e) {
+      console.log('auto-select post err:', e.message);
+      // roll back so next tick can retry
+      delete state.dailyVote[dateKey];
+      saveStateNow();
+    }
     return;
   }
 
@@ -1173,7 +1186,12 @@ async function postDailyVote() {
     await pinMessage(state.groupId, sent.message_id, false);
     trackDailyPin(sent.message_id);
     saveStateNow();
-  } catch (e) { console.log('vote post err:', e.message); }
+  } catch (e) {
+    console.log('vote post err:', e.message);
+    // roll back so next tick can retry
+    delete state.dailyVote[dateKey];
+    saveStateNow();
+  }
 }
 
 // re-render vote with updated tallies
@@ -1200,9 +1218,31 @@ async function refreshVoteKeyboard() {
     const label = tStr + ' ' + (hf ? hf + ' ' : '') + hn + ' vs ' + an + (af ? ' ' + af : '') + ' (' + count + ')';
     return [Markup.button.callback(label.slice(0, 60), 'VOTE_' + mid)];
   }).filter(Boolean);
+
+  // ALSO refresh the body text so total vote count is current.
+  // Rebuild same text that postDailyVote / maybeRepostVote use so it's consistent.
+  const totalVotes = Object.keys(v.votes).length;
+  const totalPool = EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD;
+  const matchCount = v.matchIds.length;
+  const isRepost = (v.repostCount || 0) > 0;
+  const text = E.vote + ' <b>TODAY\'S VOTE</b>\n\n' +
+    matchCount + ' matches scheduled. pick ' + (v.selectCount === 1 ? 'ONE' : 'TWO favorites') + ' for predictions.\n\n' +
+    '<b>DAILY POOL</b>: $' + totalPool.toFixed(2) + ' total\n' +
+    '($' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard' + (v.selectCount === 2 ? ', split across selected matches' : '') + ')\n\n' +
+    totalVotes + ' vote' + (totalVotes === 1 ? '' : 's') + ' so far' + (isRepost ? ' <i>(reposted to stay visible)</i>' : '') + '\n' +
+    'vote closes 2h before earliest kickoff.';
+
   try {
-    await bot.telegram.editMessageReplyMarkup(state.groupId, v.msgId, undefined, { inline_keyboard: rows.map(r => r.map(b => b)) });
-  } catch (e) {}
+    await bot.telegram.editMessageText(state.groupId, v.msgId, undefined, text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: rows.map(r => r.map(b => b)) }
+    });
+  } catch (e) {
+    // if editMessageText fails (e.g. text identical), fall back to keyboard-only edit
+    try {
+      await bot.telegram.editMessageReplyMarkup(state.groupId, v.msgId, undefined, { inline_keyboard: rows.map(r => r.map(b => b)) });
+    } catch (e2) {}
+  }
 }
 
 // Vote button handler
