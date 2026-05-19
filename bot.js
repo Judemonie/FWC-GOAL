@@ -1020,27 +1020,30 @@ function fmtMatchLine(m) {
   return '<b>' + time + ' UTC</b>  ' + hSide + ' vs ' + aSide;
 }
 
-function fmtScoreObj(m) {
+function fmtScoreObj(m, detail) {
+  // Prefer the detail score if present (this has live data from AF)
+  if (detail && detail.score && detail.score.fullTime && detail.score.fullTime.home != null) return detail.score.fullTime;
+  if (detail && detail.score && detail.score.halfTime && detail.score.halfTime.home != null) return detail.score.halfTime;
   if (!m || !m.score) return { home: 0, away: 0 };
   if (m.score.fullTime && m.score.fullTime.home != null) return m.score.fullTime;
   if (m.score.halfTime && m.score.halfTime.home != null) return m.score.halfTime;
   return { home: 0, away: 0 };
 }
 
-function fmtScore(m) {
-  const s = fmtScoreObj(m);
+function fmtScore(m, detail) {
+  const s = fmtScoreObj(m, detail);
   return (s.home == null ? 0 : s.home) + ' - ' + (s.away == null ? 0 : s.away);
 }
 
-function scoreLine(m) {
+function scoreLine(m, detail) {
   const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
   const hn = (teamName(m.homeTeam) || '?').toUpperCase();
   const an = (teamName(m.awayTeam) || '?').toUpperCase();
-  return (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b>  <b>' + fmtScore(m) + '</b>  <b>' + esc(an) + '</b>' + (af ? ' ' + af : '');
+  return (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b>  <b>' + fmtScore(m, detail) + '</b>  <b>' + esc(an) + '</b>' + (af ? ' ' + af : '');
 }
 
-function scoreLinePlain(m) {
-  return teamName(m.homeTeam) + ' ' + fmtScore(m) + ' ' + teamName(m.awayTeam);
+function scoreLinePlain(m, detail) {
+  return teamName(m.homeTeam) + ' ' + fmtScore(m, detail) + ' ' + teamName(m.awayTeam);
 }
 
 // Live minute: ALWAYS prefer API-reported minute. Fall back to wall-clock only if absent.
@@ -1783,12 +1786,22 @@ async function announceLineup(m) {
   if (!state.trackedMatches[id]) state.trackedMatches[id] = {};
   const rec = state.trackedMatches[id];
   if (rec.lineupSent) return;
-  if (!rec.afFixtureId) return; // need AF id from live tracking
+  if (!rec.afFixtureId) {
+    console.log('[LINEUP] skip:', teamName(m.homeTeam), 'vs', teamName(m.awayTeam), '- no afFixtureId');
+    return;
+  }
   const ko = new Date(m.utcDate).getTime();
   const now = Date.now();
   const minsToKo = (ko - now) / 60000;
-  // window: between 12 minutes and 1 minute before kickoff
-  if (minsToKo > 12 || minsToKo < 1) return;
+  // window: between 15 minutes and 1 minute before kickoff
+  if (minsToKo > 15 || minsToKo < 1) {
+    if (minsToKo > 0 && minsToKo < 30) {
+      // log only if we're close but outside window so we know we missed it
+      console.log('[LINEUP] outside window:', teamName(m.homeTeam), 'vs', teamName(m.awayTeam), 'mins to ko:', minsToKo.toFixed(1));
+    }
+    return;
+  }
+  console.log('[LINEUP] posting:', teamName(m.homeTeam), 'vs', teamName(m.awayTeam), 'mins to ko:', minsToKo.toFixed(1));
   rec.lineupSent = true;
   saveStateNow();
 
@@ -1976,8 +1989,11 @@ async function announceHalftime(m) {
   const rec = state.trackedMatches[id];
   if (rec.halftimeSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
+  // pull cached detail (AF data) for accurate live score
+  const cached = matchCache[m.id];
+  const detail = cached && cached.data;
   const text = E.pause + ' <b>HALF-TIME</b> ' + E.unlock + '\n\n' +
-    scoreLine(m) + '\n\n' +
+    scoreLine(m, detail) + '\n\n' +
     pick(HT_LINES);
   try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.halftimeSent = true;
@@ -1989,8 +2005,10 @@ async function announceSecondHalf(m) {
   const rec = state.trackedMatches[id];
   if (rec.secondHalfSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, true);
+  const cached = matchCache[m.id];
+  const detail = cached && cached.data;
   const text = E.play + ' <b>SECOND HALF</b> ' + E.lock + '\n\n' +
-    scoreLine(m) + '\n' +
+    scoreLine(m, detail) + '\n' +
     '<i>' + pick(SH_LINES) + '</i>';
   try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.secondHalfSent = true;
@@ -2004,7 +2022,7 @@ async function announceFulltime(m, detail) {
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
   const hn = teamName(m.homeTeam).toUpperCase();
   const an = teamName(m.awayTeam).toUpperCase();
-  const lines = [E.flag + ' <b>FULL TIME</b> ' + E.party + ' ' + E.unlock, '', scoreLine(m)];
+  const lines = [E.flag + ' <b>FULL TIME</b> ' + E.party + ' ' + E.unlock, '', scoreLine(m, detail)];
   const goals = (detail && detail.goals) || m.goals || [];
   if (goals.length) {
     const home = [], away = [];
@@ -2602,11 +2620,19 @@ async function checkGoals(m, detail) {
     else if (isAway) { scoringTeam = teamName(m.awayTeam); scoringFlag = teamFlag(m.awayTeam); }
 
     // Premium presentation: bold caps scorer, team in CAPS
+    // Use the running score we just computed (runHome/runAway) - this is accurate
+    // even if m.score and detail.score haven't caught up yet.
+    const liveScoreLine = (() => {
+      const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
+      const hn = (teamName(m.homeTeam) || '?').toUpperCase();
+      const an = (teamName(m.awayTeam) || '?').toUpperCase();
+      return (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b>  <b>' + runHome + ' - ' + runAway + '</b>  <b>' + esc(an) + '</b>' + (af ? ' ' + af : '');
+    })();
     const teamLine = (scoringFlag ? scoringFlag + ' ' : '') + '<i>for ' + esc(scoringTeam.toUpperCase()) + '</i>';
     const text = E.ball + ' <b>GOAL!</b>\n\n' +
       '<b>' + esc(scorer.toUpperCase()) + '</b> <i>' + min + '</i>\n' +
       (scoringTeam ? teamLine + '\n\n' : '\n') +
-      scoreLine(m);
+      liveScoreLine;
     try { await sendHTML(state.groupId, text); } catch (e) {}
   }
   saveStateNow();
@@ -2694,7 +2720,10 @@ async function runMatchUpdate(m) {
     await ensurePollForMatch(m);
     // Lineup post 10 min before kickoff. Needs afFixtureId from prior live cycle...
     // since match is SCHEDULED, we need to fetch AF fixture detail proactively.
-    if (!rec.afFixtureId && AF_KEYS.length && m.homeTeam && m.awayTeam) {
+    // Only do this lookup when match is within 30 min of kickoff to save API budget.
+    const koMs = m.utcDate ? new Date(m.utcDate).getTime() : 0;
+    const minsToKo = koMs ? (koMs - Date.now()) / 60000 : 9999;
+    if (!rec.afFixtureId && AF_KEYS.length && m.homeTeam && m.awayTeam && minsToKo < 30 && minsToKo > 0) {
       // try to find the AF fixture id via direct lookup using date + teams
       const ko = new Date(m.utcDate);
       const dateStr = ko.toISOString().slice(0, 10);
@@ -2704,10 +2733,15 @@ async function runMatchUpdate(m) {
           const f = findAfMatchByTeams(data.response, m.homeTeam.name, m.awayTeam.name);
           if (f && f.fixture && f.fixture.id) {
             rec.afFixtureId = f.fixture.id;
+            console.log('[LINEUP] cached afFixtureId for', teamName(m.homeTeam), 'vs', teamName(m.awayTeam), '=', f.fixture.id);
             saveStateNow();
+          } else {
+            console.log('[LINEUP] AF schedule lookup: no match found for', teamName(m.homeTeam), 'vs', teamName(m.awayTeam));
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.log('[LINEUP] AF lookup err:', e.message);
+      }
     }
     if (rec.afFixtureId) {
       await announceLineup(m).catch(e => console.log('lineup err:', e.message));
