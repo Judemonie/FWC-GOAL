@@ -28,7 +28,13 @@ const E = {
   play: '\u25B6\uFE0F',
   flag: '\u{1F3C1}',
   bell: '\u{1F514}',
-  zap: '\u26A1'
+  zap: '\u26A1',
+  point: '\u{1F447}',
+  yellow: '\u{1F7E8}',
+  red: '\u{1F7E5}',
+  swap: '\u{1F504}',
+  clipboard: '\u{1F4CB}',
+  vote: '\u{1F5F3}\uFE0F'
 };
 
 // ---------- Env ----------
@@ -288,6 +294,55 @@ function flagFor(code) {
   } catch (e) { return ''; }
 }
 
+// FIFA country name -> ISO-2 code mapping for World Cup 2026 + common international teams.
+// Source: FIFA member associations + ISO 3166-1 alpha-2.
+const COUNTRY_TO_ISO2 = {
+  'argentina': 'AR', 'australia': 'AU', 'austria': 'AT', 'belgium': 'BE',
+  'brazil': 'BR', 'canada': 'CA', 'chile': 'CL', 'colombia': 'CO',
+  'costa rica': 'CR', 'croatia': 'HR', 'czech republic': 'CZ', 'czechia': 'CZ',
+  'denmark': 'DK', 'ecuador': 'EC', 'egypt': 'EG', 'england': 'GB',
+  'france': 'FR', 'germany': 'DE', 'ghana': 'GH', 'iran': 'IR',
+  'italy': 'IT', 'ivory coast': 'CI', 'cote d ivoire': 'CI',
+  'japan': 'JP', 'jordan': 'JO', 'mexico': 'MX', 'morocco': 'MA',
+  'netherlands': 'NL', 'new zealand': 'NZ', 'nigeria': 'NG',
+  'north macedonia': 'MK', 'norway': 'NO', 'panama': 'PA',
+  'paraguay': 'PY', 'peru': 'PE', 'poland': 'PL', 'portugal': 'PT',
+  'qatar': 'QA', 'republic of ireland': 'IE', 'ireland': 'IE',
+  'romania': 'RO', 'saudi arabia': 'SA', 'scotland': 'GB',
+  'senegal': 'SN', 'serbia': 'RS', 'slovakia': 'SK', 'slovenia': 'SI',
+  'south africa': 'ZA', 'south korea': 'KR', 'korea republic': 'KR',
+  'spain': 'ES', 'sweden': 'SE', 'switzerland': 'CH', 'tunisia': 'TN',
+  'turkey': 'TR', 'turkiye': 'TR', 'uae': 'AE', 'united arab emirates': 'AE',
+  'united states': 'US', 'usa': 'US', 'uruguay': 'UY', 'uzbekistan': 'UZ',
+  'venezuela': 'VE', 'wales': 'GB', 'algeria': 'DZ', 'cameroon': 'CM',
+  'cape verde': 'CV', 'cabo verde': 'CV', 'curacao': 'CW',
+  'dominican republic': 'DO', 'el salvador': 'SV', 'guatemala': 'GT',
+  'haiti': 'HT', 'honduras': 'HN', 'jamaica': 'JM', 'bolivia': 'BO',
+  'finland': 'FI', 'greece': 'GR', 'hungary': 'HU', 'iceland': 'IS',
+  'israel': 'IL', 'kazakhstan': 'KZ', 'kosovo': 'XK', 'luxembourg': 'LU',
+  'malta': 'MT', 'moldova': 'MD', 'montenegro': 'ME', 'russia': 'RU',
+  'ukraine': 'UA', 'iraq': 'IQ', 'lebanon': 'LB', 'oman': 'OM',
+  'palestine': 'PS', 'syria': 'SY', 'yemen': 'YE',
+  'china': 'CN', 'china pr': 'CN', 'india': 'IN', 'indonesia': 'ID',
+  'malaysia': 'MY', 'philippines': 'PH', 'singapore': 'SG',
+  'thailand': 'TH', 'vietnam': 'VN', 'angola': 'AO', 'burkina faso': 'BF',
+  'congo': 'CG', 'dr congo': 'CD', 'gabon': 'GA', 'guinea': 'GN',
+  'kenya': 'KE', 'libya': 'LY', 'mali': 'ML', 'mauritania': 'MR',
+  'mozambique': 'MZ', 'sudan': 'SD', 'tanzania': 'TZ', 'togo': 'TG',
+  'uganda': 'UG', 'zambia': 'ZM', 'zimbabwe': 'ZW', 'bahrain': 'BH',
+  'kuwait': 'KW', 'azerbaijan': 'AZ', 'belarus': 'BY', 'bulgaria': 'BG',
+  'estonia': 'EE', 'georgia': 'GE', 'latvia': 'LV', 'lithuania': 'LT',
+  'albania': 'AL', 'armenia': 'AM', 'bosnia and herzegovina': 'BA',
+  'cyprus': 'CY'
+};
+
+function countryToFlag(countryName) {
+  if (!countryName) return '';
+  const key = String(countryName).toLowerCase().trim();
+  const iso = COUNTRY_TO_ISO2[key];
+  return iso ? flagFor(iso) : '';
+}
+
 function teamName(team) {
   if (!team) return '?';
   return team.shortName || team.name || team.tla || '?';
@@ -304,8 +359,11 @@ function isNationalLeague() {
 function teamFlag(team) {
   if (!team) return '';
   // Only show flags for national-team tournaments (World Cup, Euros, etc.)
+  // For club tournaments, both teams are typically same-country so flags add noise.
   if (!isNationalLeague()) return '';
-  return flagFor((team.tla || '').slice(0, 2));
+  // Prefer explicit country (set by AF data shaper), fall back to team name.
+  const country = (team.country) || (team.area && team.area.name) || team.name;
+  return countryToFlag(country);
 }
 
 // flag + name with conditional space (no leading/trailing space when flag is empty)
@@ -466,7 +524,8 @@ function shapeAfMatchToFd(af, baseMatch) {
     },
     goals,
     minute,
-    apiSource: 'af'
+    apiSource: 'af',
+    _afEvents: (af.events || []) // expose raw events for card/sub detection
   };
 }
 
@@ -935,20 +994,20 @@ async function handleOffense(ctx) {
 // ---------- Message variants ----------
 const GOAL_OPENERS = ['GOAL ' + E.ball, 'GOOOAL ' + E.ball + E.ball, 'GOAL!! ' + E.fire, 'IN! ' + E.ball, 'GOAL ' + E.ball + E.fire];
 const KICKOFF_LINES = [
-  'we are underway. chat locked',
-  'kickoff! ball is rolling',
+  'and we are off',
+  'ball is rolling',
   'here we go',
-  'underway. talk at half-time',
-  'and we are off'
+  'underway'
 ];
+// Half-time prompts: short, community-focused, rotating
 const HT_LINES = [
-  'half-time. chat is open',
-  'break time. take a breather',
-  'first half done. talk among yourselves',
-  'half-time whistle. chat unlocked'
+  "how's everyone seeing this one? " + E.point + "\n15 mins until we are back",
+  "second-half prediction? drop it " + E.point + "\nback in 15 mins",
+  "what's the vibe? drop a take " + E.point + "\n15 mins to second half",
+  "thoughts so far? talk to me " + E.point + "\nsecond half in 15"
 ];
-const FT_LINES = ['full time ' + E.party, 'final whistle ' + E.party, 'thats it. all over', 'match over'];
-const SH_LINES = ['second half. chat locked again', 'back underway', 'they are back out'];
+const FT_LINES = ["that's the final whistle", "match over", "thats it. all done", "full time, see you next match"];
+const SH_LINES = ['back underway', 'second half. here we go', 'they are back out', 'second half rolling'];
 
 // ---------- Formatting ----------
 function fmtMatchLine(m) {
@@ -974,7 +1033,10 @@ function fmtScore(m) {
 }
 
 function scoreLine(m) {
-  return esc(teamName(m.homeTeam)) + '  <b>' + fmtScore(m) + '</b>  ' + esc(teamName(m.awayTeam));
+  const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
+  const hn = (teamName(m.homeTeam) || '?').toUpperCase();
+  const an = (teamName(m.awayTeam) || '?').toUpperCase();
+  return (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b>  <b>' + fmtScore(m) + '</b>  <b>' + esc(an) + '</b>' + (af ? ' ' + af : '');
 }
 
 function scoreLinePlain(m) {
@@ -1050,13 +1112,15 @@ async function postDailyVote() {
     };
     saveStateNow();
     const hf = teamFlag(onlyMatch.homeTeam), af = teamFlag(onlyMatch.awayTeam);
+    const hn = teamName(onlyMatch.homeTeam).toUpperCase();
+    const an = teamName(onlyMatch.awayTeam).toUpperCase();
     const ko = new Date(onlyMatch.utcDate);
     const tStr = String(ko.getUTCHours()).padStart(2, '0') + ':' + String(ko.getUTCMinutes()).padStart(2, '0');
-    const announce = '<b>' + E.trophy + ' today\'s match</b>\n\n' +
+    const announce = E.trophy + ' <b>TODAY\'S MATCH</b>\n\n' +
       'only one match scheduled. no vote needed.\n\n' +
-      hf + ' <b>' + esc(teamName(onlyMatch.homeTeam)) + '</b> vs <b>' + esc(teamName(onlyMatch.awayTeam)) + '</b> ' + af + '\n' +
+      (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b>' + (af ? ' ' + af : '') + '\n' +
       tStr + ' UTC kickoff\n\n' +
-      'prediction pools open 1 hour before kickoff.\n' +
+      '<b>PREDICTION POOLS</b> open 1 hour before kickoff\n' +
       'pools: $' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard';
     try {
       const sent = await sendHTML(state.groupId, announce);
@@ -1071,15 +1135,14 @@ async function postDailyVote() {
   const perMatchPool = totalPool / selectCount;
 
   const lines = [
-    '<b>' + E.trophy + ' VOTE: today\'s prediction match</b>',
+    E.vote + ' <b>TODAY\'S VOTE</b>',
     '',
-    upcoming.length + ' matches today. pick ' + (selectCount === 1 ? 'ONE' : 'TWO favorites') + '.',
+    upcoming.length + ' matches scheduled. pick ' + (selectCount === 1 ? 'ONE' : 'TWO favorites') + ' for predictions.',
     '',
-    'today\'s pool: $' + totalPool.toFixed(2),
-    'split: $' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard',
-    selectCount === 2 ? '(divided across the 2 selected matches)' : '',
+    '<b>DAILY POOL</b>: $' + totalPool.toFixed(2) + ' total',
+    '($' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard' + (selectCount === 2 ? ', split across selected matches' : '') + ')',
     '',
-    'vote closes 2h before the earliest match kickoff.'
+    'vote closes 2h before earliest kickoff.'
   ].filter(Boolean).join('\n');
 
   // build buttons per match - capped to 8 to keep keyboard sane
@@ -1088,7 +1151,9 @@ async function postDailyVote() {
     const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
     const t = new Date(m.utcDate);
     const tStr = String(t.getUTCHours()).padStart(2, '0') + ':' + String(t.getUTCMinutes()).padStart(2, '0');
-    const label = tStr + ' ' + hf + ' ' + teamName(m.homeTeam) + ' vs ' + teamName(m.awayTeam) + ' ' + af + ' (0)';
+    const hn = (teamName(m.homeTeam) || '').toUpperCase();
+    const an = (teamName(m.awayTeam) || '').toUpperCase();
+    const label = tStr + ' ' + (hf ? hf + ' ' : '') + hn + ' vs ' + an + (af ? ' ' + af : '') + ' (0)';
     return [Markup.button.callback(label.slice(0, 60), 'VOTE_' + m.id)];
   });
 
@@ -1130,7 +1195,9 @@ async function refreshVoteKeyboard() {
     const t = new Date(m.utcDate);
     const tStr = String(t.getUTCHours()).padStart(2, '0') + ':' + String(t.getUTCMinutes()).padStart(2, '0');
     const count = tally[mid] || 0;
-    const label = tStr + ' ' + hf + ' ' + teamName(m.homeTeam) + ' vs ' + teamName(m.awayTeam) + ' ' + af + ' (' + count + ')';
+    const hn = (teamName(m.homeTeam) || '').toUpperCase();
+    const an = (teamName(m.awayTeam) || '').toUpperCase();
+    const label = tStr + ' ' + (hf ? hf + ' ' : '') + hn + ' vs ' + an + (af ? ' ' + af : '') + ' (' + count + ')';
     return [Markup.button.callback(label.slice(0, 60), 'VOTE_' + mid)];
   }).filter(Boolean);
   try {
@@ -1197,14 +1264,16 @@ async function maybeRepostVote() {
     const t = new Date(m.utcDate);
     const tStr = String(t.getUTCHours()).padStart(2, '0') + ':' + String(t.getUTCMinutes()).padStart(2, '0');
     const count = tally[mid] || 0;
-    const label = tStr + ' ' + hf + ' ' + teamName(m.homeTeam) + ' vs ' + teamName(m.awayTeam) + ' ' + af + ' (' + count + ')';
+    const hn = (teamName(m.homeTeam) || '').toUpperCase();
+    const an = (teamName(m.awayTeam) || '').toUpperCase();
+    const label = tStr + ' ' + (hf ? hf + ' ' : '') + hn + ' vs ' + an + (af ? ' ' + af : '') + ' (' + count + ')';
     return [Markup.button.callback(label.slice(0, 60), 'VOTE_' + mid)];
   }).filter(Boolean);
 
   const totalVotes = Object.keys(v.votes).length;
-  const text = '<b>' + E.trophy + ' VOTE: today\'s prediction match</b>\n\n' +
+  const text = E.vote + ' <b>TODAY\'S VOTE</b>\n\n' +
     'pick the match you want predictions on.\n' +
-    totalVotes + ' votes so far. <i>(reposted to stay visible)</i>';
+    totalVotes + ' vote' + (totalVotes === 1 ? '' : 's') + ' so far <i>(reposted to stay visible)</i>';
   try {
     const sent = await sendHTML(state.groupId, text, Markup.inlineKeyboard(rows));
     v.msgId = sent.message_id;
@@ -1281,27 +1350,35 @@ async function maybeCloseVote() {
   v.closed = true;
   saveStateNow();
 
-  // close keyboard
+  // close keyboard, then DELETE the vote message entirely - it gets replaced by VOTE ENDED below
   if (v.msgId) {
-    try { await bot.telegram.editMessageReplyMarkup(state.groupId, v.msgId, undefined, { inline_keyboard: [] }); } catch (e) {}
+    try { await bot.telegram.deleteMessage(state.groupId, v.msgId); } catch (e) {}
   }
 
-  // announce
+  // announce: VOTE ENDED with selected matches
   const selectedMatches = selected.map(mid => matches.find(x => String(x.id) === mid)).filter(Boolean);
-  const lines = ['<b>' + E.check + ' vote closed</b>', ''];
-  lines.push('predicting today:');
+  const lines = [E.check + ' <b>VOTE ENDED</b>', ''];
+  lines.push('<b>PREDICTING TODAY:</b>');
   for (const m of selectedMatches) {
     const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
-    lines.push('  ' + hf + ' ' + esc(teamName(m.homeTeam)) + ' vs ' + esc(teamName(m.awayTeam)) + ' ' + af);
+    const hn = (teamName(m.homeTeam) || '?').toUpperCase();
+    const an = (teamName(m.awayTeam) || '?').toUpperCase();
+    const t = new Date(m.utcDate);
+    const tStr = String(t.getUTCHours()).padStart(2, '0') + ':' + String(t.getUTCMinutes()).padStart(2, '0');
+    lines.push((hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b>' + (af ? ' ' + af : '') + ' \u2014 ' + tStr + ' UTC');
   }
   lines.push('');
-  lines.push('pool per match: $' + (v.perMatchPool).toFixed(2));
+  lines.push('<b>POOL PER MATCH:</b> $' + (v.perMatchPool).toFixed(2));
   lines.push('  easy: $' + (EASY_POOL_USD / v.selectCount).toFixed(2));
   lines.push('  medium: $' + (MEDIUM_POOL_USD / v.selectCount).toFixed(2));
   lines.push('  hard: $' + (HARD_POOL_USD / v.selectCount).toFixed(2));
   lines.push('');
-  lines.push('prediction pools opening shortly.');
-  try { await sendHTML(state.groupId, lines.join('\n')); } catch (e) {}
+  lines.push('<i>prediction pools open 1h before each kickoff.</i>');
+  try {
+    const sent = await sendHTML(state.groupId, lines.join('\n'));
+    await pinMessage(state.groupId, sent.message_id, true); // silent pin (replaces the vote pin)
+    trackDailyPin(sent.message_id);
+  } catch (e) {}
 }
 
 // only allow ensurePredictionForMatch for SELECTED matches
@@ -1349,6 +1426,7 @@ async function ensurePredictionForMatch(m) {
   const h = m.homeTeam || {}, a = m.awayTeam || {};
   const hf = teamFlag(h), af = teamFlag(a);
   const hn = teamName(h), an = teamName(a);
+  const hnUp = hn.toUpperCase(), anUp = an.toUpperCase();
   if (!state.predictions[id]) state.predictions[id] = { quick: {}, pro: {}, exact: {} };
 
   // Pinned-instructions reminder (small)
@@ -1363,15 +1441,15 @@ async function ensurePredictionForMatch(m) {
   // Quick pool
   if (!state.predictionMsgs[id].quickMsgId) {
     const splitNote = (state.dailyVote[getDateKey()] && state.dailyVote[getDateKey()].selectCount > 1) ? ' (split with other match)' : '';
-    const quickText = '<b>' + E.trophy + ' EASY: WINNER PICK</b>\n\n' +
-      hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af + '\n' +
+    const quickText = E.trophy + ' <b>EASY: WINNER PICK</b>\n\n' +
+      (hf ? hf + ' ' : '') + '<b>' + esc(hnUp) + '</b> vs <b>' + esc(anUp) + '</b>' + (af ? ' ' + af : '') + '\n' +
       'pick who wins\n' +
-      'pool: $' + (EASY_POOL_USD / (state.dailyVote[getDateKey()] ? state.dailyVote[getDateKey()].selectCount : 1)).toFixed(2) + splitNote + '\n' +
+      'pool: $' + (EASY_POOL_USD / (state.dailyVote[getDateKey()] ? state.dailyVote[getDateKey()].selectCount : 1)).toFixed(2) + splitNote + '\n\n' +
       '<i>split among correct predictors by bag size</i>';
     const quickKb = Markup.inlineKeyboard([
-      [Markup.button.callback(hf + ' ' + hn, 'PR_' + id + '_q_H')],
-      [Markup.button.callback('draw', 'PR_' + id + '_q_D')],
-      [Markup.button.callback(an + ' ' + af, 'PR_' + id + '_q_A')]
+      [Markup.button.callback((hf ? hf + ' ' : '') + hnUp, 'PR_' + id + '_q_H')],
+      [Markup.button.callback('DRAW', 'PR_' + id + '_q_D')],
+      [Markup.button.callback(anUp + (af ? ' ' + af : ''), 'PR_' + id + '_q_A')]
     ]);
     try {
       const sent = await sendHTML(state.groupId, quickText, quickKb);
@@ -1382,17 +1460,19 @@ async function ensurePredictionForMatch(m) {
   // Pro pool
   if (!state.predictionMsgs[id].proMsgId) {
     const splitCount = state.dailyVote[getDateKey()] ? state.dailyVote[getDateKey()].selectCount : 1;
-    const proText = '<b>' + E.fire + ' MEDIUM: WINNER + GOALS</b>\n\n' +
-      hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af + '\n' +
+    const proText = E.fire + ' <b>MEDIUM: WINNER + GOALS</b>\n\n' +
+      (hf ? hf + ' ' : '') + '<b>' + esc(hnUp) + '</b> vs <b>' + esc(anUp) + '</b>' + (af ? ' ' + af : '') + '\n' +
       'winner + over/under 2.5 goals\n' +
       'pool: $' + (MEDIUM_POOL_USD / splitCount).toFixed(2);
+    const homeAbbr3 = ((m.homeTeam && m.homeTeam.tla) || hn || 'HOM').slice(0, 3).toUpperCase();
+    const awayAbbr3 = ((m.awayTeam && m.awayTeam.tla) || an || 'AWY').slice(0, 3).toUpperCase();
     const proKb = Markup.inlineKeyboard([
-      [Markup.button.callback(hf + ' ' + hn + ' / O', 'PR_' + id + '_p_HO'),
-       Markup.button.callback(hf + ' ' + hn + ' / U', 'PR_' + id + '_p_HU')],
-      [Markup.button.callback('Draw / O', 'PR_' + id + '_p_DO'),
-       Markup.button.callback('Draw / U', 'PR_' + id + '_p_DU')],
-      [Markup.button.callback(an + ' ' + af + ' / O', 'PR_' + id + '_p_AO'),
-       Markup.button.callback(an + ' ' + af + ' / U', 'PR_' + id + '_p_AU')]
+      [Markup.button.callback(homeAbbr3 + '/O', 'PR_' + id + '_p_HO'),
+       Markup.button.callback(homeAbbr3 + '/U', 'PR_' + id + '_p_HU')],
+      [Markup.button.callback('DRW/O', 'PR_' + id + '_p_DO'),
+       Markup.button.callback('DRW/U', 'PR_' + id + '_p_DU')],
+      [Markup.button.callback(awayAbbr3 + '/O', 'PR_' + id + '_p_AO'),
+       Markup.button.callback(awayAbbr3 + '/U', 'PR_' + id + '_p_AU')]
     ]);
     try {
       const sent = await sendHTML(state.groupId, proText, proKb);
@@ -1403,12 +1483,10 @@ async function ensurePredictionForMatch(m) {
   // Hard pool: HT/FT prediction, 3x3 grid
   if (!state.predictionMsgs[id].exactMsgId) {
     const splitCount = state.dailyVote[getDateKey()] ? state.dailyVote[getDateKey()].selectCount : 1;
-    // Format: PR_<id>_e_<HT><FT>  where HT/FT each are H, D, or A
-    // Prefer official 3-letter TLA, fall back to first 3 letters of name
     const homeAbbr = ((m.homeTeam && m.homeTeam.tla) || hn || 'HOM').slice(0, 3).toUpperCase();
     const awayAbbr = ((m.awayTeam && m.awayTeam.tla) || an || 'AWY').slice(0, 3).toUpperCase();
     const exactText = E.trophy + E.fire + ' <b>HARD: HALF/FULL TIME</b>\n\n' +
-      hf + ' <b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b> ' + af + '\n' +
+      (hf ? hf + ' ' : '') + '<b>' + esc(hnUp) + '</b> vs <b>' + esc(anUp) + '</b>' + (af ? ' ' + af : '') + '\n' +
       'pick who leads at half-time AND who wins at full-time\n' +
       'pool: $' + (HARD_POOL_USD / splitCount).toFixed(2) + '\n\n' +
       '<i>buttons: half-time result / full-time result</i>\n' +
@@ -1658,6 +1736,157 @@ bot.on('text', async (ctx, next) => {
     { parse_mode: 'HTML' });
 });
 
+// Fetch and post lineup ~10 min before kickoff. Deleted at kickoff time.
+async function announceLineup(m) {
+  if (!AF_KEYS.length) return;
+  const id = String(m.id);
+  if (!state.trackedMatches[id]) state.trackedMatches[id] = {};
+  const rec = state.trackedMatches[id];
+  if (rec.lineupSent) return;
+  if (!rec.afFixtureId) return; // need AF id from live tracking
+  const ko = new Date(m.utcDate).getTime();
+  const now = Date.now();
+  const minsToKo = (ko - now) / 60000;
+  // window: between 12 minutes and 1 minute before kickoff
+  if (minsToKo > 12 || minsToKo < 1) return;
+  rec.lineupSent = true;
+  saveStateNow();
+
+  let data;
+  try { data = await afGet('/fixtures/lineups?fixture=' + rec.afFixtureId); }
+  catch (e) { return; }
+  if (!data || !data.response || !data.response.length) {
+    // graceful fallback
+    try {
+      const sent = await sendHTML(state.groupId,
+        E.clipboard + ' <b>LINEUPS</b>\n\n<i>not yet published. check back closer to kickoff.</i>');
+      rec.lineupMsgId = sent.message_id;
+      saveStateNow();
+    } catch (e) {}
+    return;
+  }
+
+  const lineups = data.response;
+  const homeName = teamName(m.homeTeam).toUpperCase();
+  const awayName = teamName(m.awayTeam).toUpperCase();
+  const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
+
+  function renderSide(lu, flagStr, nameUp) {
+    const out = [];
+    const formation = lu.formation ? ' (' + lu.formation + ')' : '';
+    out.push((flagStr ? flagStr + ' ' : '') + '<b>' + esc(nameUp) + '</b>' + formation);
+    // Group players: starters by line (GK, DEF, MID, ATT) based on grid
+    const starters = (lu.startXI || []).map(p => p.player || p).filter(Boolean);
+    if (starters.length) {
+      // sort by grid: '1:1' (GK row 1) ... '4:3'
+      const byRow = {};
+      for (const p of starters) {
+        const grid = p.grid || '?:?';
+        const row = grid.split(':')[0];
+        if (!byRow[row]) byRow[row] = [];
+        byRow[row].push(p.name || '?');
+      }
+      const rowKeys = Object.keys(byRow).sort();
+      for (const r of rowKeys) {
+        out.push(byRow[r].map(n => esc(n)).join(' \u00b7 '));
+      }
+    } else {
+      out.push('<i>squad not available</i>');
+    }
+    return out.join('\n');
+  }
+
+  const lines = [E.clipboard + ' <b>LINEUP \u2014 ' + esc(homeName) + ' vs ' + esc(awayName) + '</b>', ''];
+  // try to match home and away by team name
+  const hCanon = canonicalTeamName(teamName(m.homeTeam));
+  const aCanon = canonicalTeamName(teamName(m.awayTeam));
+  let homeLu = null, awayLu = null;
+  for (const lu of lineups) {
+    const lc = canonicalTeamName((lu.team && lu.team.name) || '');
+    if (!homeLu && (lc === hCanon || hCanon.includes(lc) || lc.includes(hCanon))) homeLu = lu;
+    else if (!awayLu && (lc === aCanon || aCanon.includes(lc) || lc.includes(aCanon))) awayLu = lu;
+  }
+  if (!homeLu && lineups[0]) homeLu = lineups[0];
+  if (!awayLu && lineups[1]) awayLu = lineups[1];
+  if (homeLu) lines.push(renderSide(homeLu, hf, homeName));
+  lines.push('');
+  if (awayLu) lines.push(renderSide(awayLu, af, awayName));
+  lines.push('');
+  lines.push('<i>kickoff in ' + Math.max(1, Math.round(minsToKo)) + ' min ' + E.green + '</i>');
+
+  try {
+    const sent = await sendHTML(state.groupId, lines.join('\n'));
+    rec.lineupMsgId = sent.message_id;
+    saveStateNow();
+  } catch (e) { console.log('lineup post err:', e.message); }
+}
+
+// Post a card/sub event. Auto-deletes after 5 min to keep chat clean.
+async function postEphemeralEvent(text) {
+  if (!state.groupId) return;
+  try {
+    const sent = await sendHTML(state.groupId, text);
+    // auto-delete after 5 min
+    setTimeout(() => {
+      bot.telegram.deleteMessage(state.groupId, sent.message_id).catch(() => {});
+    }, 5 * 60 * 1000);
+  } catch (e) {}
+}
+
+// Detect new cards and subs from AF events, post and auto-delete.
+async function checkCardsAndSubs(m, detail) {
+  if (!state.settings.goalAlerts) return; // gate on same toggle as goals
+  if (!detail || !detail._afEvents) return; // requires AF event data
+  const id = String(m.id);
+  const rec = state.trackedMatches[id];
+  if (rec.fulltimeSent) return;
+  if (!rec.announcedEventKeys) rec.announcedEventKeys = {}; // key -> 1
+
+  const events = detail._afEvents;
+  for (const ev of events) {
+    const tp = ev.type;
+    if (tp !== 'Card' && tp !== 'subst') continue;
+    const player = (ev.player && ev.player.name) || '?';
+    const team = (ev.team && ev.team.name) || '?';
+    const minute = (ev.time && ev.time.elapsed) || 0;
+    const detail2 = ev.detail || '';
+    const key = tp + '|' + player + '|' + team + '|' + minute + '|' + detail2;
+    if (rec.announcedEventKeys[key]) continue;
+    rec.announcedEventKeys[key] = 1;
+
+    // figure out which side this team is
+    const tCanon = canonicalTeamName(team);
+    const isHome = canonicalTeamName(teamName(m.homeTeam)) === tCanon;
+    const teamObj = isHome ? m.homeTeam : m.awayTeam;
+    const tFlag = teamFlag(teamObj);
+    const tName = teamName(teamObj).toUpperCase();
+
+    let text = '';
+    if (tp === 'Card') {
+      const isRed = /red/i.test(detail2);
+      if (isRed) {
+        text = E.red + ' <b>RED CARD</b>\n\n' +
+          (tFlag ? tFlag + ' ' : '') + '<b>' + esc(player.toUpperCase()) + '</b> ' + minute + "'\n" +
+          esc(tName) + ' \u2014 down to 10';
+      } else {
+        text = E.yellow + ' <b>YELLOW</b>\n\n' +
+          (tFlag ? tFlag + ' ' : '') + '<b>' + esc(player.toUpperCase()) + '</b> ' + minute + "'\n" +
+          esc(tName);
+      }
+    } else if (tp === 'subst') {
+      // ev.player.name is the one coming OFF, ev.assist.name is coming ON (per AF docs)
+      const off = player;
+      const on = (ev.assist && ev.assist.name) || '?';
+      text = E.swap + ' <b>SUB \u2014 ' + esc(tName) + '</b>\n\n' +
+        'OUT: ' + esc(off) + '\n' +
+        'IN: ' + esc(on) + '\n' +
+        minute + "'";
+    }
+    if (text) await postEphemeralEvent(text);
+  }
+  saveStateNow();
+}
+
 async function announceKickoff(m) {
   const id = String(m.id);
   const rec = state.trackedMatches[id];
@@ -1680,14 +1909,21 @@ async function announceKickoff(m) {
       }
     }
     if (totalEntries > 0) {
-      try { await sendHTML(state.groupId, '<b>predictions locked.</b> <i>' + totalEntries + ' entries across all pools</i>'); } catch (e) {}
+      try { await sendHTML(state.groupId, '<b>PREDICTIONS LOCKED</b> <i>' + totalEntries + ' entries across all pools</i>'); } catch (e) {}
     }
+  }
+  // delete lineup message at kickoff
+  if (rec.lineupMsgId) {
+    try { await bot.telegram.deleteMessage(state.groupId, rec.lineupMsgId); } catch (e) {}
+    rec.lineupMsgId = null;
   }
   if (state.settings.autoLock) await setGroupLocked(state.groupId, true);
   const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
+  const hn = teamName(m.homeTeam).toUpperCase();
+  const an = teamName(m.awayTeam).toUpperCase();
   const text = E.green + ' <b>KICKOFF</b> ' + E.lock + '\n\n' +
-    hf + ' <b>' + esc(teamName(m.homeTeam)) + '</b> vs <b>' + esc(teamName(m.awayTeam)) + '</b> ' + af + '\n' +
-    pick(KICKOFF_LINES);
+    (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b>' + (af ? ' ' + af : '') + '\n' +
+    '<i>' + pick(KICKOFF_LINES) + '</i>';
   try {
     await sendHTML(state.groupId, text);
   } catch (e) {}
@@ -1700,7 +1936,9 @@ async function announceHalftime(m) {
   const rec = state.trackedMatches[id];
   if (rec.halftimeSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
-  const text = E.pause + ' <b>HALF-TIME</b> ' + E.unlock + '\n\n' + scoreLine(m) + '\n' + pick(HT_LINES);
+  const text = E.pause + ' <b>HALF-TIME</b> ' + E.unlock + '\n\n' +
+    scoreLine(m) + '\n\n' +
+    pick(HT_LINES);
   try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.halftimeSent = true;
   saveStateNow();
@@ -1711,7 +1949,9 @@ async function announceSecondHalf(m) {
   const rec = state.trackedMatches[id];
   if (rec.secondHalfSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, true);
-  const text = E.play + ' <b>SECOND HALF</b> ' + E.lock + '\n' + pick(SH_LINES);
+  const text = E.play + ' <b>SECOND HALF</b> ' + E.lock + '\n\n' +
+    scoreLine(m) + '\n' +
+    '<i>' + pick(SH_LINES) + '</i>';
   try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.secondHalfSent = true;
   saveStateNow();
@@ -1722,6 +1962,8 @@ async function announceFulltime(m, detail) {
   const rec = state.trackedMatches[id];
   if (rec.fulltimeSent) return;
   if (state.settings.autoLock) await setGroupLocked(state.groupId, false);
+  const hn = teamName(m.homeTeam).toUpperCase();
+  const an = teamName(m.awayTeam).toUpperCase();
   const lines = [E.flag + ' <b>FULL TIME</b> ' + E.party + ' ' + E.unlock, '', scoreLine(m)];
   const goals = (detail && detail.goals) || m.goals || [];
   if (goals.length) {
@@ -1731,20 +1973,23 @@ async function announceFulltime(m, detail) {
       const min = (g.minute != null ? g.minute + "'" : '');
       const line = esc(who) + (min ? ' <i>' + min + '</i>' : '');
       const teamId = g.team && g.team.id;
-      if (teamId === (m.homeTeam && m.homeTeam.id)) home.push(line);
-      else if (teamId === (m.awayTeam && m.awayTeam.id)) away.push(line);
+      const teamN = g.team && g.team.name;
+      const isHome = teamId === (m.homeTeam && m.homeTeam.id) || teamN === (m.homeTeam && m.homeTeam.name);
+      const isAway = teamId === (m.awayTeam && m.awayTeam.id) || teamN === (m.awayTeam && m.awayTeam.name);
+      if (isHome) home.push(line);
+      else if (isAway) away.push(line);
     }
     if (home.length || away.length) {
       lines.push('');
-      lines.push('<b>' + esc(teamName(m.homeTeam)) + '</b>');
-      lines.push(home.join(', ') || '-');
+      lines.push('<b>' + esc(hn) + '</b>');
+      lines.push(home.length ? home.join(', ') : '-');
       lines.push('');
-      lines.push('<b>' + esc(teamName(m.awayTeam)) + '</b>');
-      lines.push(away.join(', ') || '-');
+      lines.push('<b>' + esc(an) + '</b>');
+      lines.push(away.length ? away.join(', ') : '-');
     }
   }
   lines.push('');
-  lines.push(pick(FT_LINES));
+  lines.push('<i>' + pick(FT_LINES) + '</i>');
   try {
     const sent = await sendHTML(state.groupId, lines.join('\n'));
     // loud pin: this is the final result, everyone should see it
@@ -1869,43 +2114,39 @@ async function calculateWinnersForMatch(m, detail) {
   const allWinners = [...quickWinners, ...proWinners, ...exactWinners];
 
   // post summary to group
-  const lines = ['<b>' + E.trophy + ' prediction results</b>', ''];
-  const outcomeStr = (actualWinner === 'H' ? teamName(m.homeTeam) : actualWinner === 'A' ? teamName(m.awayTeam) : 'Draw') +
-    ' | ' + homeScore + '-' + awayScore + ' (' + (actualOU === 'O' ? 'over' : 'under') + ', HT: ' + htHome + '-' + htAway + ')';
-  lines.push('outcome: ' + esc(outcomeStr));
+  const hn = teamName(m.homeTeam).toUpperCase();
+  const an = teamName(m.awayTeam).toUpperCase();
+  const lines = [E.trophy + ' <b>PREDICTION RESULTS</b>', ''];
+  lines.push('<b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b>');
+  const winnerLabel = (actualWinner === 'H' ? hn : actualWinner === 'A' ? an : 'DRAW');
+  lines.push('final: <b>' + homeScore + '-' + awayScore + '</b> (' + (actualOU === 'O' ? 'over' : 'under') + ' 2.5, HT: ' + htHome + '-' + htAway + ', ' + esc(winnerLabel) + ')');
   lines.push('');
-  function poolLine(label, entries, correct, winners, budget) {
-    let s = label + ': ' + entries + ' entries / ' + correct + ' correct';
-    if (correct === 0) s += ' (no winners)';
-    else if (winners.length === 0) s += ' (no eligible holders)';
-    else if (winners.length === 1) s += ' - winner: @' + esc(winners[0].username || 'user') + ' $' + winners[0].amountUsd.toFixed(2);
-    else s += ' - $' + budget.toFixed(2) + ' split ' + winners.length + ' ways';
-    return s;
-  }
-  lines.push(poolLine('easy (winner)', Object.keys(state.predictions[id].quick || {}).length, quickCorrect.length, quickWinners, easyBudget));
-  lines.push(poolLine('medium (w+goals)', Object.keys(state.predictions[id].pro || {}).length, proCorrect.length, proWinners, mediumBudget));
-  lines.push(poolLine('hard (HT/FT)', Object.keys(state.predictions[id].exact || {}).length, exactCorrect.length, exactWinners, hardBudget));
 
-  if (allWinners.length > 1) {
-    lines.push('');
-    lines.push('<b>winners:</b>');
-    for (const w of allWinners) {
-      const name = w.username ? '@' + w.username : 'user';
-      const poolLabel = w.pool === 'quick' ? 'easy' : w.pool === 'pro' ? 'medium' : 'hard';
-      lines.push('  ' + poolLabel + ': ' + esc(name) + ' $' + w.amountUsd.toFixed(2));
-    }
+  function poolBlock(headerCaps, entries, correct, winners, budget) {
+    const out = ['<b>' + headerCaps + '</b>'];
+    out.push(entries + ' entries \u00b7 ' + correct + ' correct');
+    if (correct === 0) out.push('<i>no winners \u2014 pool stays in wallet</i>');
+    else if (winners.length === 0) out.push('<i>no eligible holders \u2014 pool stays in wallet</i>');
+    else if (winners.length === 1) out.push('$' + budget.toFixed(2) + ' to winner');
+    else out.push('$' + budget.toFixed(2) + ' split between ' + winners.length + ' winners');
+    out.push('');
+    return out;
   }
+  lines.push(...poolBlock('EASY (winner)', Object.keys(state.predictions[id].quick || {}).length, quickCorrect.length, quickWinners, easyBudget));
+  lines.push(...poolBlock('MEDIUM (winner + goals)', Object.keys(state.predictions[id].pro || {}).length, proCorrect.length, proWinners, mediumBudget));
+  lines.push(...poolBlock('HARD (HT/FT)', Object.keys(state.predictions[id].exact || {}).length, exactCorrect.length, exactWinners, hardBudget));
+
   if (allWinners.length) {
-    lines.push('');
-    lines.push('<i>rewards under review.</i>');
+    lines.push('<i>winners notified by DM. payouts under review.</i>');
   }
   try { await sendHTML(state.groupId, lines.join('\n')); } catch (e) {}
 
   // queue pending rewards
   const price = await getFwcPriceUSD();
+  const queuedThisMatch = [];
   for (const w of allWinners) {
     const fwc = usdToFwc(w.amountUsd, price);
-    state.pendingRewards.push({
+    const queued = {
       matchId: id,
       matchLabel: teamName(m.homeTeam) + ' vs ' + teamName(m.awayTeam),
       userId: w.userId,
@@ -1920,12 +2161,31 @@ async function calculateWinnersForMatch(m, detail) {
       priceAtCalc: price,
       createdAt: Date.now(),
       status: 'pending'
-    });
+    };
+    state.pendingRewards.push(queued);
+    queuedThisMatch.push(queued);
+  }
+
+  // DM each winner now that the FWC amount is known
+  for (const q of queuedThisMatch) {
+    try {
+      const poolLabel = q.pool === 'quick' ? 'EASY' : q.pool === 'pro' ? 'MEDIUM' : 'HARD';
+      await bot.telegram.sendMessage(q.userId,
+        E.trophy + ' <b>YOU WON!</b>\n\n' +
+        'pool: <b>' + poolLabel + '</b>\n' +
+        'match: ' + esc(q.matchLabel) + '\n' +
+        'your prediction was correct ' + E.check + '\n\n' +
+        'your share: <b>' + q.amountFWC.toFixed(2) + ' FWC</b> ($' + q.amountUSD.toFixed(2) + ')\n\n' +
+        '<i>reward is under review and will be sent shortly. you\'ll get another DM with the transaction once it\'s out.</i>',
+        { parse_mode: 'HTML' });
+    } catch (e) {}
   }
 
   if (allWinners.length) {
     if (!state.dailyTotals[dateKey]) state.dailyTotals[dateKey] = { sentUSD: 0, attemptedUSD: 0, matchesPaid: 0 };
     state.dailyTotals[dateKey].matchesPaid += 1;
+    // auto-send batch review DM to owner now that winners are queued
+    setTimeout(() => sendDailyBatchNow().catch(e => console.log('auto batch err:', e.message)), 2000);
   }
   saveStateNow();
 }
@@ -1957,21 +2217,36 @@ async function sendDailyBatchNow() {
   }
   const totalUsd = pending.reduce((a, r) => a + r.amountUSD, 0);
   const totalFwc = pending.reduce((a, r) => a + r.amountFWC, 0);
-  const lines = ['<b>' + E.money + ' reward batch</b>', ''];
-  lines.push(pending.length + ' winners | total $' + totalUsd.toFixed(2) + ' | ' + totalFwc.toFixed(2) + ' FWC');
-  lines.push('');
-  pending.forEach((r, i) => {
-    lines.push('<b>' + (i + 1) + '. ' + esc(r.matchLabel) + '</b>');
-    lines.push('  pool: ' + r.pool + (r.isHolder ? ' | holder ' + E.check : ''));
-    lines.push('  winner: @' + esc(r.username || ('user' + r.userId)));
-    lines.push('  wallet: <code>' + esc(r.wallet) + '</code>');
-    lines.push('  reward: $' + r.amountUSD.toFixed(2) + ' = ' + r.amountFWC.toFixed(2) + ' FWC');
-    lines.push('');
+
+  // group by match for clean presentation
+  const byMatch = {};
+  pending.forEach(r => {
+    const key = r.matchLabel || 'match';
+    if (!byMatch[key]) byMatch[key] = [];
+    byMatch[key].push(r);
   });
+
+  const lines = [E.money + ' <b>REWARD BATCH READY</b>', ''];
+  lines.push(pending.length + ' winner' + (pending.length === 1 ? '' : 's') + ' \u00b7 total: ' + totalFwc.toFixed(2) + ' FWC ($' + totalUsd.toFixed(2) + ')');
+  lines.push('');
+
+  let i = 1;
+  for (const matchKey in byMatch) {
+    lines.push('<b>' + esc(matchKey) + '</b>');
+    for (const r of byMatch[matchKey]) {
+      const poolLabel = (r.pool === 'quick' ? 'EASY' : r.pool === 'pro' ? 'MEDIUM' : 'HARD');
+      const wshort = r.wallet ? (r.wallet.slice(0, 6) + '...' + r.wallet.slice(-4)) : '?';
+      lines.push((i) + '. <b>' + poolLabel + '</b> \u2014 @' + esc(r.username || 'user'));
+      lines.push('   bag: ' + fmtFwc(r.bagFwc || 0) + ' FWC \u00b7 wallet <code>' + esc(wshort) + '</code>');
+      lines.push('   pays: <b>' + r.amountFWC.toFixed(2) + ' FWC</b> ($' + r.amountUSD.toFixed(2) + ')');
+      i += 1;
+    }
+    lines.push('');
+  }
   lines.push(DRY_RUN ? '<i>DRY RUN mode is ON. transactions will be simulated.</i>' : '<b>LIVE mode.</b> approve will send real FWC.');
 
   const kb = Markup.inlineKeyboard([
-    [Markup.button.callback(E.check + ' approve all', 'BATCH_APPROVE_ALL')],
+    [Markup.button.callback(E.check + ' approve all and send', 'BATCH_APPROVE_ALL')],
     [Markup.button.callback('edit', 'BATCH_EDIT'), Markup.button.callback(E.cross + ' reject all', 'BATCH_REJECT_ALL')]
   ]);
   try {
@@ -2192,18 +2467,19 @@ async function processApprovedBatch(ctx) {
       sentTotalUsd += r.amountUSD;
       sentTotalFwc += r.amountFWC;
       results.push((sendRes.dryRun ? 'DRY ' : '') + 'sent ' + r.amountFWC.toFixed(2) + ' FWC to @' + (r.username || 'user') + ' tx:' + sendRes.txHash.slice(0, 14) + '...');
-      // DM the winner with full details
+      // DM the winner with the new premium template
       try {
-        const poolLabel = r.pool === 'quick' ? 'easy' : r.pool === 'pro' ? 'medium' : 'hard';
+        const poolLabel = r.pool === 'quick' ? 'EASY' : r.pool === 'pro' ? 'MEDIUM' : 'HARD';
         const scanUrl = 'https://bscscan.com/tx/' + sendRes.txHash;
         await bot.telegram.sendMessage(r.userId,
           (sendRes.dryRun ? '<b>[DRY RUN]</b> ' : '') +
-          E.trophy + ' <b>you won!</b>\n\n' +
+          E.check + ' <b>your reward has been sent successfully</b>\n\n' +
+          'amount: <b>' + r.amountFWC.toFixed(2) + ' FWC</b>\n' +
           'pool: ' + poolLabel + '\n' +
           'match: ' + esc(r.matchLabel || '?') + '\n' +
-          'amount: <b>' + r.amountFWC.toFixed(2) + ' FWC</b> ($' + r.amountUSD.toFixed(2) + ')\n\n' +
-          'tx hash:\n<code>' + esc(sendRes.txHash) + '</code>\n\n' +
-          (sendRes.dryRun ? '<i>(test mode - no real funds moved)</i>' : '<a href="' + scanUrl + '">view on BSCScan</a>'),
+          'tx: <code>' + esc(sendRes.txHash) + '</code>\n\n' +
+          (sendRes.dryRun ? '<i>(test mode \u2014 no real funds moved)</i>' : '<a href="' + scanUrl + '">view on BSCScan</a>') + '\n\n' +
+          '<i>see you in the next match.</i>',
           { parse_mode: 'HTML', disable_web_page_preview: true });
       } catch (e) {}
     } catch (err) {
@@ -2214,8 +2490,6 @@ async function processApprovedBatch(ctx) {
     }
   }
   state.pendingRewards = state.pendingRewards.filter(r => r.status === 'pending');
-  // clear the standing reminder since batch was processed
-  await clearBatchReminder();
   saveStateNow();
 
   // owner gets full batch summary in DM
@@ -2225,13 +2499,13 @@ async function processApprovedBatch(ctx) {
     '<pre>' + esc(results.join('\n')) + '</pre>';
   try { await ctx.reply(summary, { parse_mode: 'HTML' }); } catch (e) {}
 
-  // group gets a clean, non-spammy announcement
+  // group gets a clean, non-spammy announcement - NO usernames
   if (okCount > 0 && state.groupId) {
     try {
-      const groupMsg = '<b>' + E.trophy + ' rewards sent</b>\n\n' +
+      const groupMsg = E.check + ' <b>REWARDS PAID</b>\n\n' +
         okCount + ' winner' + (okCount > 1 ? 's' : '') + ' paid\n' +
-        'total: ' + sentTotalFwc.toFixed(2) + ' FWC ($' + sentTotalUsd.toFixed(2) + ')\n\n' +
-        '<i>each winner received their transaction hash via DM.</i>' +
+        'total distributed: <b>' + sentTotalFwc.toFixed(2) + ' FWC</b>\n\n' +
+        'winners \u2014 check your DM and wallet ' + E.money +
         (DRY_RUN ? '\n<i>(dry run mode)</i>' : '');
       await sendHTML(state.groupId, groupMsg);
     } catch (e) { console.log('group announce err:', e.message); }
@@ -2251,54 +2525,10 @@ async function checkGoals(m, detail) {
   // initialize tracking
   if (!rec.announcedScoreStates) rec.announcedScoreStates = {}; // "1-0" -> ts
   if (!rec.announcedGoalKeys) rec.announcedGoalKeys = []; // scorer|team|minute
-  if (!rec.announcedGoalMsgs) rec.announcedGoalMsgs = {}; // goalKey -> { messageId, scoreState }
-  // skip VAR consistency until we have 2+ polls confirming, to avoid false deletes from flaky API
-  if (!rec.goalDisallowCheck) rec.goalDisallowCheck = {}; // goalKey -> consecutive missing count
 
   const goals = (detail && detail.goals) || m.goals || [];
-  const now = Date.now();
-
-  // build set of current goal keys from this poll
-  const currentGoalKeys = new Set();
-  for (const g of goals) {
-    const scorer = (g.scorer && g.scorer.name) || 'unknown';
-    const teamKey = (g.team && (g.team.id || g.team.name)) || '?';
-    currentGoalKeys.add(scorer + '|' + teamKey + '|' + (g.minute || '?'));
-  }
-
-  // VAR check: any previously-announced goal that's NO LONGER in current goals?
-  // Require 2 consecutive polls showing it missing before we treat as disallowed (avoids flaky data).
-  for (const announcedKey of rec.announcedGoalKeys) {
-    if (currentGoalKeys.has(announcedKey)) {
-      // goal still there, reset disallow counter
-      rec.goalDisallowCheck[announcedKey] = 0;
-      continue;
-    }
-    rec.goalDisallowCheck[announcedKey] = (rec.goalDisallowCheck[announcedKey] || 0) + 1;
-    // Need 2 confirmations + we must have the message ID to act on it
-    if (rec.goalDisallowCheck[announcedKey] >= 2 && rec.announcedGoalMsgs[announcedKey]) {
-      const info = rec.announcedGoalMsgs[announcedKey];
-      // delete original goal message
-      try { await bot.telegram.deleteMessage(state.groupId, info.messageId); } catch (e) {}
-      // post a brief disallowed notice
-      try {
-        const parts = announcedKey.split('|');
-        const who = parts[0] || 'goal';
-        const min = parts[2] || '?';
-        await sendHTML(state.groupId,
-          E.cross + ' <b>GOAL DISALLOWED</b>\n\n' +
-          'previous goal (' + esc(who) + ' ' + esc(min) + "') has been chalked off after review.\n" +
-          'current score: <b>' + fmtScore(m) + '</b>');
-      } catch (e) {}
-      // roll back tracking for this goal so future score states work
-      if (info.scoreState) delete rec.announcedScoreStates[info.scoreState];
-      delete rec.announcedGoalMsgs[announcedKey];
-      delete rec.goalDisallowCheck[announcedKey];
-      rec.announcedGoalKeys = rec.announcedGoalKeys.filter(k => k !== announcedKey);
-    }
-  }
-
   if (!goals.length) { saveStateNow(); return; }
+  const now = Date.now();
 
   // sort goals by minute ascending so we announce in order
   const sorted = [...goals].sort((a, b) => (a.minute || 0) - (b.minute || 0));
@@ -2331,71 +2561,20 @@ async function checkGoals(m, detail) {
     if (isHome) { scoringTeam = teamName(m.homeTeam); scoringFlag = teamFlag(m.homeTeam); }
     else if (isAway) { scoringTeam = teamName(m.awayTeam); scoringFlag = teamFlag(m.awayTeam); }
 
-    // build the alert with consistent emoji opener
+    // Premium presentation: bold caps scorer, team in CAPS
+    const teamLine = (scoringFlag ? scoringFlag + ' ' : '') + '<i>for ' + esc(scoringTeam.toUpperCase()) + '</i>';
     const text = E.ball + ' <b>GOAL!</b>\n\n' +
-      scoringFlag + ' <b>' + esc(scorer) + '</b> <i>' + min + '</i>' +
-      (scoringTeam ? '\n<i>for ' + esc(scoringTeam) + '</i>' : '') + '\n\n' +
+      '<b>' + esc(scorer.toUpperCase()) + '</b> <i>' + min + '</i>\n' +
+      (scoringTeam ? teamLine + '\n\n' : '\n') +
       scoreLine(m);
-    try {
-      const sent = await sendHTML(state.groupId, text);
-      // track message id so we can delete if VAR disallows
-      rec.announcedGoalMsgs[goalKey] = { messageId: sent.message_id, scoreState };
-    } catch (e) {}
+    try { await sendHTML(state.groupId, text); } catch (e) {}
   }
   saveStateNow();
 }
 
 // ---------- Adaptive polling tick ----------
-// ---------- Batch reminder DMs ----------
-// Sends owner a DM reminder when there are pending rewards >= 30 min after last match ended.
-// Each new reminder deletes the previous one so the chat doesn't fill with reminders.
-async function maybeRemindOwnerOfBatch() {
-  if (!OWNER_ID) return;
-  const pending = state.pendingRewards.filter(r => r.status === 'pending');
-  if (!pending.length) return;
-
-  // find most recent createdAt among pending
-  const latestCreated = Math.max(...pending.map(r => r.createdAt || 0));
-  const now = Date.now();
-  // wait at least 30 min after the last winner was queued
-  if (now - latestCreated < 30 * 60 * 1000) return;
-
-  // re-remind every 60 min
-  if (state.lastBatchReminderAt && now - state.lastBatchReminderAt < 60 * 60 * 1000) return;
-
-  // delete previous reminder if we have it
-  if (state.lastBatchReminderMsgId) {
-    try { await bot.telegram.deleteMessage(OWNER_ID, state.lastBatchReminderMsgId); } catch (e) {}
-    state.lastBatchReminderMsgId = null;
-  }
-
-  // build reminder
-  let totalUsd = 0, totalFwc = 0;
-  for (const r of pending) {
-    totalUsd += r.amountUSD || 0;
-    totalFwc += r.amountFWC || 0;
-  }
-  const text = E.bell + ' <b>reward batch waiting</b>\n\n' +
-    pending.length + ' winner' + (pending.length > 1 ? 's' : '') + ' queued\n' +
-    'total: ' + totalFwc.toFixed(2) + ' FWC ($' + totalUsd.toFixed(2) + ')\n\n' +
-    'DM <code>/sendbatch</code> to review and approve.';
-  try {
-    const sent = await bot.telegram.sendMessage(OWNER_ID, text, { parse_mode: 'HTML' });
-    state.lastBatchReminderMsgId = sent.message_id;
-    state.lastBatchReminderAt = now;
-    saveStateNow();
-  } catch (e) { console.log('batch reminder send err:', e.message); }
-}
-
-// Clear reminder state when batch is processed (called from processApprovedBatch)
-async function clearBatchReminder() {
-  if (state.lastBatchReminderMsgId && OWNER_ID) {
-    try { await bot.telegram.deleteMessage(OWNER_ID, state.lastBatchReminderMsgId); } catch (e) {}
-  }
-  state.lastBatchReminderMsgId = null;
-  state.lastBatchReminderAt = 0;
-}
-
+// Batch is auto-sent to OWNER_ID after each match's winners are queued.
+// No reminder DMs - the review message is the only notification.
 let tickRunning = false;
 let lastFullPoll = 0;
 
@@ -2473,6 +2652,26 @@ async function runMatchUpdate(m) {
 
   if (status === 'SCHEDULED' || status === 'TIMED') {
     await ensurePollForMatch(m);
+    // Lineup post 10 min before kickoff. Needs afFixtureId from prior live cycle...
+    // since match is SCHEDULED, we need to fetch AF fixture detail proactively.
+    if (!rec.afFixtureId && AF_KEYS.length && m.homeTeam && m.awayTeam) {
+      // try to find the AF fixture id via direct lookup using date + teams
+      const ko = new Date(m.utcDate);
+      const dateStr = ko.toISOString().slice(0, 10);
+      try {
+        const data = await afGet('/fixtures?date=' + dateStr);
+        if (data && data.response) {
+          const f = findAfMatchByTeams(data.response, m.homeTeam.name, m.awayTeam.name);
+          if (f && f.fixture && f.fixture.id) {
+            rec.afFixtureId = f.fixture.id;
+            saveStateNow();
+          }
+        }
+      } catch (e) {}
+    }
+    if (rec.afFixtureId) {
+      await announceLineup(m).catch(e => console.log('lineup err:', e.message));
+    }
     return;
   }
 
@@ -2481,6 +2680,7 @@ async function runMatchUpdate(m) {
     const detail = await fetchMatchDetail(m.id);
     if (detail) {
       await checkGoals(m, detail);
+      await checkCardsAndSubs(m, detail).catch(e => console.log('cards err:', e.message));
     }
     if (rec.halftimeSent && !rec.secondHalfSent) {
       const ko = new Date(m.utcDate).getTime();
@@ -2524,8 +2724,6 @@ async function autopilotTick() {
     // Auto-repost active prompts if buried
     await maybeRepostVote().catch(e => console.log('repost vote err:', e.message));
     await maybeRepostPrediction().catch(e => console.log('repost pred err:', e.message));
-    // Owner reminder DMs for unpaid batches
-    await maybeRemindOwnerOfBatch().catch(e => console.log('batch remind err:', e.message));
 
     // full schedule poll every 60s
     if (now - lastFullPoll > 60000) {
@@ -2746,24 +2944,24 @@ bot.command('help', async (ctx) => {
 function buildInstructionsText(botUsername) {
   const handle = botUsername ? '@' + botUsername : 'me';
   return [
-    '<b>' + E.trophy + ' FWC PREDICTIONS</b>',
+    E.trophy + ' <b>FWC PREDICTIONS</b>',
     '',
-    '<b>setup (one time):</b>',
+    '<b>SETUP</b> (one time):',
     '1. hold <b>' + fmtFwc(MIN_HOLD_FWC) + ' FWC</b>',
     '2. DM ' + handle + ' \u2192 tap <b>Start</b> \u2192 send your wallet',
     '',
-    '<b>each match day:</b>',
+    '<b>EACH MATCH DAY:</b>',
     '\u2022 ' + VOTE_HOUR_UTC + 'am UTC \u2014 vote on the match',
     '\u2022 1h before kickoff \u2014 prediction pools open',
     '\u2022 kickoff \u2014 pools close, chat locks',
     '\u2022 full-time \u2014 winners split the pool',
     '',
-    '<b>the 3 pools:</b>',
-    '\u2022 EASY \u2014 pick the winner',
-    '\u2022 MEDIUM \u2014 winner + over/under 2.5 goals',
-    '\u2022 HARD \u2014 half-time leader / full-time winner',
+    '<b>THE 3 POOLS:</b>',
+    '\u2022 <b>EASY</b> \u2014 pick the winner',
+    '\u2022 <b>MEDIUM</b> \u2014 winner + over/under 2.5 goals',
+    '\u2022 <b>HARD</b> \u2014 half-time leader / full-time winner',
     '',
-    '<b>daily pool:</b> $' + EASY_POOL_USD + ' / $' + MEDIUM_POOL_USD + ' / $' + HARD_POOL_USD + '. bigger bag = bigger share.',
+    '<b>DAILY POOL:</b> $' + EASY_POOL_USD + ' / $' + MEDIUM_POOL_USD + ' / $' + HARD_POOL_USD + '. bigger bag = bigger share.',
     '',
     '<i>community token. not affiliated. dyor.</i>'
   ].join('\n');
