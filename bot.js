@@ -34,7 +34,8 @@ const E = {
   red: '\u{1F7E5}',
   swap: '\u{1F504}',
   clipboard: '\u{1F4CB}',
-  vote: '\u{1F5F3}\uFE0F'
+  vote: '\u{1F5F3}\uFE0F',
+  timer: '\u23F1\uFE0F'
 };
 
 // ---------- Env ----------
@@ -78,7 +79,10 @@ const PER_WIN_CAP_USD = parseFloat(process.env.PER_WIN_CAP_USD || '25');
 
 // Voting/selection
 const VOTE_HOUR_UTC = parseInt(process.env.VOTE_HOUR_UTC || '5', 10);  // also when daily schedule posts
-const VOTE_CLOSE_HOURS_BEFORE = parseFloat(process.env.VOTE_CLOSE_HOURS_BEFORE || '2');
+const VOTE_CLOSE_HOURS_BEFORE = parseFloat(process.env.VOTE_CLOSE_HOURS_BEFORE || '3');
+// Gap (in minutes) between vote closing and prediction pools opening.
+// Gives users time to see the VOTE ENDED message and which matches were selected.
+const PREDICTION_DELAY_AFTER_VOTE_MIN = parseFloat(process.env.PREDICTION_DELAY_AFTER_VOTE_MIN || '30');
 
 // Auto-repost active prompts after this many non-bot group messages
 const REPOST_THRESHOLD = parseInt(process.env.REPOST_THRESHOLD || '8', 10);
@@ -123,7 +127,9 @@ let state = {
   lastBatchReminderMsgId: null,
   lastBatchReminderAt: 0,
   // track loud-pinned daily messages so they can be unpinned next day
-  dailyPins: []
+  dailyPins: [],
+  // global counter incremented on each non-bot group message (for live-board repost logic)
+  groupMessageCounter: 0
 };
 
 // hot in-memory caches
@@ -994,20 +1000,30 @@ async function handleOffense(ctx) {
 // ---------- Message variants ----------
 const GOAL_OPENERS = ['GOAL ' + E.ball, 'GOOOAL ' + E.ball + E.ball, 'GOAL!! ' + E.fire, 'IN! ' + E.ball, 'GOAL ' + E.ball + E.fire];
 const KICKOFF_LINES = [
-  'and we are off',
-  'ball is rolling',
-  'here we go',
-  'underway'
+  "And we're live! The match has started.",
+  "We're underway. Ball is rolling.",
+  "Here we go. Match is on.",
+  "Kickoff. Let the game begin."
 ];
-// Half-time prompts: short, community-focused, rotating
+// Half-time prompts: short, engaging, rotating
 const HT_LINES = [
-  "how's everyone seeing this one? " + E.point + "\n15 mins until we are back",
-  "second-half prediction? drop it " + E.point + "\nback in 15 mins",
-  "what's the vibe? drop a take " + E.point + "\n15 mins to second half",
-  "thoughts so far? talk to me " + E.point + "\nsecond half in 15"
+  "First half is in the books. How's everyone seeing this one so far? " + E.point + "\n15 minutes until we are back.",
+  "End of the first 45. What's your second-half prediction? " + E.point + "\nBack in 15.",
+  "Half-time. Talk to me \u2014 cruising or game on? " + E.point + "\nSecond half in 15 mins.",
+  "Break time. Drop your half-time thoughts " + E.point + "\nWe will be back in 15 minutes."
 ];
-const FT_LINES = ["that's the final whistle", "match over", "thats it. all done", "full time, see you next match"];
-const SH_LINES = ['back underway', 'second half. here we go', 'they are back out', 'second half rolling'];
+const FT_LINES = [
+  "That's the final whistle.",
+  "Match over. See you in the next one.",
+  "Full time. Thanks for tuning in.",
+  "And that's all done. Until the next match."
+];
+const SH_LINES = [
+  "Back underway. Locked in for the next 45.",
+  "Second half rolling. Stay tuned.",
+  "We are back. Forty-five more minutes to go.",
+  "Second half is on. Here we go again."
+];
 
 // ---------- Formatting ----------
 function fmtMatchLine(m) {
@@ -1119,7 +1135,9 @@ async function postDailyVote() {
       selected: [String(onlyMatch.id)],
       selectCount: 1,
       perMatchPool: EASY_POOL_USD + MEDIUM_POOL_USD + HARD_POOL_USD,
-      autoSelected: true
+      autoSelected: true,
+      // same 30-min delay as voted matches for consistent UX
+      predictionsOpenAt: Date.now() + PREDICTION_DELAY_AFTER_VOTE_MIN * 60 * 1000
     };
     saveStateNow();
     const hf = teamFlag(onlyMatch.homeTeam), af = teamFlag(onlyMatch.awayTeam);
@@ -1131,7 +1149,7 @@ async function postDailyVote() {
       'only one match scheduled. no vote needed.\n\n' +
       (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b>' + (af ? ' ' + af : '') + '\n' +
       tStr + ' UTC kickoff\n\n' +
-      '<b>PREDICTION POOLS</b> open 1 hour before kickoff\n' +
+      '<b>PREDICTION POOLS</b> open in ' + PREDICTION_DELAY_AFTER_VOTE_MIN + ' minutes ' + E.timer + '\n' +
       'pools: $' + EASY_POOL_USD + ' easy / $' + MEDIUM_POOL_USD + ' medium / $' + HARD_POOL_USD + ' hard';
     try {
       const sent = await sendHTML(state.groupId, announce);
@@ -1380,17 +1398,30 @@ async function maybeCloseVote() {
     const mid = v.votes[uid];
     tally[mid] = (tally[mid] || 0) + 1;
   }
-  // sort matches by votes desc, then by earliest kickoff
-  const ranked = [...v.matchIds].sort((a, b) => {
-    const tb = (tally[b] || 0) - (tally[a] || 0);
-    if (tb !== 0) return tb;
-    const ma = matches.find(x => String(x.id) === a);
-    const mb = matches.find(x => String(x.id) === b);
-    return new Date(ma.utcDate) - new Date(mb.utcDate);
-  });
-  const selected = ranked.slice(0, v.selectCount);
+  const totalVotes = Object.keys(v.votes).length;
+
+  let selected;
+  if (totalVotes === 0) {
+    // NOBODY VOTED. Pick randomly from today's matches.
+    const shuffled = [...v.matchIds].sort(() => Math.random() - 0.5);
+    selected = shuffled.slice(0, v.selectCount);
+    console.log('[VOTE] no votes received - picking randomly:', selected);
+  } else {
+    // sort matches by votes desc, then by earliest kickoff for tie-break
+    const ranked = [...v.matchIds].sort((a, b) => {
+      const tb = (tally[b] || 0) - (tally[a] || 0);
+      if (tb !== 0) return tb;
+      const ma = matches.find(x => String(x.id) === a);
+      const mb = matches.find(x => String(x.id) === b);
+      return new Date(ma.utcDate) - new Date(mb.utcDate);
+    });
+    selected = ranked.slice(0, v.selectCount);
+  }
   v.selected = selected;
   v.closed = true;
+  // Predictions open after the configured delay (default 30 min) so users
+  // can see the VOTE ENDED message before they have to choose.
+  v.predictionsOpenAt = Date.now() + PREDICTION_DELAY_AFTER_VOTE_MIN * 60 * 1000;
   saveStateNow();
 
   // close keyboard, then DELETE the vote message entirely - it gets replaced by VOTE ENDED below
@@ -1401,6 +1432,10 @@ async function maybeCloseVote() {
   // announce: VOTE ENDED with selected matches
   const selectedMatches = selected.map(mid => matches.find(x => String(x.id) === mid)).filter(Boolean);
   const lines = [E.check + ' <b>VOTE ENDED</b>', ''];
+  if (totalVotes === 0) {
+    lines.push('<i>no votes received \u2014 bot picked randomly.</i>');
+    lines.push('');
+  }
   lines.push('<b>PREDICTING TODAY:</b>');
   for (const m of selectedMatches) {
     const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
@@ -1416,7 +1451,7 @@ async function maybeCloseVote() {
   lines.push('  medium: $' + (MEDIUM_POOL_USD / v.selectCount).toFixed(2));
   lines.push('  hard: $' + (HARD_POOL_USD / v.selectCount).toFixed(2));
   lines.push('');
-  lines.push('<i>prediction pools open 1h before each kickoff.</i>');
+  lines.push('<i>prediction pools open in ' + PREDICTION_DELAY_AFTER_VOTE_MIN + ' minutes ' + E.timer + '</i>');
   try {
     const sent = await sendHTML(state.groupId, lines.join('\n'));
     await pinMessage(state.groupId, sent.message_id, true); // silent pin (replaces the vote pin)
@@ -1442,7 +1477,8 @@ async function ensurePollForMatch(m) {
   if (rec.pollMsgId) return;
   const ko = new Date(m.utcDate).getTime();
   const diff = ko - Date.now();
-  if (diff > 60 * 60 * 1000 || diff < 0) return;
+  // Open after vote close (no longer gated to 1h before)
+  if (diff < 0) return;
   const h = m.homeTeam || {}, a = m.awayTeam || {};
   const q = teamName(h) + ' vs ' + teamName(a) + ' - who wins?';
   const opts = [teamFlag(h) + ' ' + teamName(h), teamFlag(a) + ' ' + teamName(a), 'Draw'];
@@ -1464,7 +1500,13 @@ async function ensurePredictionForMatch(m) {
   if (state.predictionMsgs[id].quickMsgId && state.predictionMsgs[id].proMsgId && state.predictionMsgs[id].exactMsgId) return;
   const ko = new Date(m.utcDate).getTime();
   const diff = ko - Date.now();
-  if (diff > 60 * 60 * 1000 || diff < 0) return;
+  // Still close at kickoff
+  if (diff < 0) return;
+  // Gate: wait for the configured delay after vote close before opening pools.
+  // This gives users 30 min to see the VOTE ENDED message and selected matches first.
+  const dateKey = getDateKey();
+  const v = state.dailyVote[dateKey];
+  if (v && v.predictionsOpenAt && Date.now() < v.predictionsOpenAt) return;
 
   const h = m.homeTeam || {}, a = m.awayTeam || {};
   const hf = teamFlag(h), af = teamFlag(a);
@@ -1490,9 +1532,11 @@ async function ensurePredictionForMatch(m) {
       'pool: $' + (EASY_POOL_USD / (state.dailyVote[getDateKey()] ? state.dailyVote[getDateKey()].selectCount : 1)).toFixed(2) + splitNote + '\n\n' +
       '<i>split among correct predictors by bag size</i>';
     const quickKb = Markup.inlineKeyboard([
-      [Markup.button.callback((hf ? hf + ' ' : '') + hnUp, 'PR_' + id + '_q_H')],
-      [Markup.button.callback('DRAW', 'PR_' + id + '_q_D')],
-      [Markup.button.callback(anUp + (af ? ' ' + af : ''), 'PR_' + id + '_q_A')]
+      [
+        Markup.button.callback((hf ? hf + ' ' : '') + hnUp, 'PR_' + id + '_q_H'),
+        Markup.button.callback('DRAW', 'PR_' + id + '_q_D'),
+        Markup.button.callback(anUp + (af ? ' ' + af : ''), 'PR_' + id + '_q_A')
+      ]
     ]);
     try {
       const sent = await sendHTML(state.groupId, quickText, quickKb);
@@ -1510,12 +1554,16 @@ async function ensurePredictionForMatch(m) {
     const homeAbbr3 = ((m.homeTeam && m.homeTeam.tla) || hn || 'HOM').slice(0, 3).toUpperCase();
     const awayAbbr3 = ((m.awayTeam && m.awayTeam.tla) || an || 'AWY').slice(0, 3).toUpperCase();
     const proKb = Markup.inlineKeyboard([
-      [Markup.button.callback(homeAbbr3 + '/O', 'PR_' + id + '_p_HO'),
-       Markup.button.callback(homeAbbr3 + '/U', 'PR_' + id + '_p_HU')],
-      [Markup.button.callback('DRW/O', 'PR_' + id + '_p_DO'),
-       Markup.button.callback('DRW/U', 'PR_' + id + '_p_DU')],
-      [Markup.button.callback(awayAbbr3 + '/O', 'PR_' + id + '_p_AO'),
-       Markup.button.callback(awayAbbr3 + '/U', 'PR_' + id + '_p_AU')]
+      [
+        Markup.button.callback(homeAbbr3 + '/O', 'PR_' + id + '_p_HO'),
+        Markup.button.callback('DRW/O', 'PR_' + id + '_p_DO'),
+        Markup.button.callback(awayAbbr3 + '/O', 'PR_' + id + '_p_AO')
+      ],
+      [
+        Markup.button.callback(homeAbbr3 + '/U', 'PR_' + id + '_p_HU'),
+        Markup.button.callback('DRW/U', 'PR_' + id + '_p_DU'),
+        Markup.button.callback(awayAbbr3 + '/U', 'PR_' + id + '_p_AU')
+      ]
     ]);
     try {
       const sent = await sendHTML(state.groupId, proText, proKb);
@@ -1874,72 +1922,6 @@ async function announceLineup(m) {
   } catch (e) { console.log('lineup post err:', e.message); }
 }
 
-// Post a card/sub event. Auto-deletes after 5 min to keep chat clean.
-async function postEphemeralEvent(text) {
-  if (!state.groupId) return;
-  try {
-    const sent = await sendHTML(state.groupId, text);
-    // auto-delete after 5 min
-    setTimeout(() => {
-      bot.telegram.deleteMessage(state.groupId, sent.message_id).catch(() => {});
-    }, 5 * 60 * 1000);
-  } catch (e) {}
-}
-
-// Detect new cards and subs from AF events, post and auto-delete.
-async function checkCardsAndSubs(m, detail) {
-  if (!state.settings.goalAlerts) return; // gate on same toggle as goals
-  if (!detail || !detail._afEvents) return; // requires AF event data
-  const id = String(m.id);
-  const rec = state.trackedMatches[id];
-  if (rec.fulltimeSent) return;
-  if (!rec.announcedEventKeys) rec.announcedEventKeys = {}; // key -> 1
-
-  const events = detail._afEvents;
-  for (const ev of events) {
-    const tp = ev.type;
-    if (tp !== 'Card' && tp !== 'subst') continue;
-    const player = (ev.player && ev.player.name) || '?';
-    const team = (ev.team && ev.team.name) || '?';
-    const minute = (ev.time && ev.time.elapsed) || 0;
-    const detail2 = ev.detail || '';
-    const key = tp + '|' + player + '|' + team + '|' + minute + '|' + detail2;
-    if (rec.announcedEventKeys[key]) continue;
-    rec.announcedEventKeys[key] = 1;
-
-    // figure out which side this team is
-    const tCanon = canonicalTeamName(team);
-    const isHome = canonicalTeamName(teamName(m.homeTeam)) === tCanon;
-    const teamObj = isHome ? m.homeTeam : m.awayTeam;
-    const tFlag = teamFlag(teamObj);
-    const tName = teamName(teamObj).toUpperCase();
-
-    let text = '';
-    if (tp === 'Card') {
-      const isRed = /red/i.test(detail2);
-      if (isRed) {
-        text = E.red + ' <b>RED CARD</b>\n\n' +
-          (tFlag ? tFlag + ' ' : '') + '<b>' + esc(player.toUpperCase()) + '</b> ' + minute + "'\n" +
-          esc(tName) + ' \u2014 down to 10';
-      } else {
-        text = E.yellow + ' <b>YELLOW</b>\n\n' +
-          (tFlag ? tFlag + ' ' : '') + '<b>' + esc(player.toUpperCase()) + '</b> ' + minute + "'\n" +
-          esc(tName);
-      }
-    } else if (tp === 'subst') {
-      // ev.player.name is the one coming OFF, ev.assist.name is coming ON (per AF docs)
-      const off = player;
-      const on = (ev.assist && ev.assist.name) || '?';
-      text = E.swap + ' <b>SUB \u2014 ' + esc(tName) + '</b>\n\n' +
-        'OUT: ' + esc(off) + '\n' +
-        'IN: ' + esc(on) + '\n' +
-        minute + "'";
-    }
-    if (text) await postEphemeralEvent(text);
-  }
-  saveStateNow();
-}
-
 async function announceKickoff(m) {
   const id = String(m.id);
   const rec = state.trackedMatches[id];
@@ -1975,8 +1957,8 @@ async function announceKickoff(m) {
   const hn = teamName(m.homeTeam).toUpperCase();
   const an = teamName(m.awayTeam).toUpperCase();
   const text = E.green + ' <b>KICKOFF</b> ' + E.lock + '\n\n' +
-    (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b>' + (af ? ' ' + af : '') + '\n' +
-    '<i>' + pick(KICKOFF_LINES) + '</i>';
+    (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b> vs <b>' + esc(an) + '</b>' + (af ? ' ' + af : '') + '\n\n' +
+    pick(KICKOFF_LINES);
   try {
     await sendHTML(state.groupId, text);
   } catch (e) {}
@@ -2008,8 +1990,8 @@ async function announceSecondHalf(m) {
   const cached = matchCache[m.id];
   const detail = cached && cached.data;
   const text = E.play + ' <b>SECOND HALF</b> ' + E.lock + '\n\n' +
-    scoreLine(m, detail) + '\n' +
-    '<i>' + pick(SH_LINES) + '</i>';
+    scoreLine(m, detail) + '\n\n' +
+    pick(SH_LINES);
   try { await sendHTML(state.groupId, text); } catch (e) {}
   rec.secondHalfSent = true;
   saveStateNow();
@@ -2574,69 +2556,263 @@ async function processApprovedBatch(ctx) {
 setInterval(maybeSendDailyBatch, 10 * 60 * 1000); // every 10 min
 
 // Smart goal dedup with 90s correction window
+// ---------- Live Boards (Goals, Cards, Subs) ----------
+// One board per match per category. New events delete the old board and post a fresh one.
+// State stored under rec.boards = { goals: { msgId, events: [{key, minute, team, scorer, score}] }, cards: {...}, subs: {...} }
+
+function ensureBoards(rec) {
+  if (!rec.boards) rec.boards = {};
+  if (!rec.boards.goals) rec.boards.goals = { msgId: null, events: [], messageCounterAtPost: 0 };
+  if (!rec.boards.cards) rec.boards.cards = { msgId: null, events: [], messageCounterAtPost: 0 };
+  if (!rec.boards.subs) rec.boards.subs = { msgId: null, events: [], messageCounterAtPost: 0 };
+}
+
+function renderScoreHeader(m, runHome, runAway) {
+  const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
+  const hn = (teamName(m.homeTeam) || '?').toUpperCase();
+  const an = (teamName(m.awayTeam) || '?').toUpperCase();
+  return (hf ? hf + ' ' : '') + '<b>' + esc(hn) + ' ' + runHome + ' - ' + runAway + ' ' + esc(an) + '</b>' + (af ? ' ' + af : '');
+}
+
+function renderGoalsBoardText(m, events) {
+  // events: [{minute, team, scorer, isHome}]
+  let runHome = 0, runAway = 0;
+  for (const ev of events) {
+    if (ev.isHome) runHome += 1;
+    else if (ev.isAway) runAway += 1;
+  }
+  const lines = [E.ball + ' <b>LIVE GOALS UPDATE</b>', ''];
+  lines.push(renderScoreHeader(m, runHome, runAway));
+  lines.push('');
+  lines.push('<b>GOALS:</b>');
+  if (!events.length) {
+    lines.push('<i>none yet</i>');
+  } else {
+    let runH = 0, runA = 0;
+    for (const ev of events) {
+      if (ev.isHome) runH += 1; else if (ev.isAway) runA += 1;
+      const tName = (ev.teamName || '?').toUpperCase();
+      lines.push(ev.minute + "' " + esc(tName) + ' \u2014 ' + esc(ev.scorer));
+    }
+  }
+  const lastMin = events.length ? events[events.length - 1].minute : 0;
+  lines.push('');
+  lines.push('<i>LAST UPDATED: ' + lastMin + "'</i>");
+  return lines.join('\n');
+}
+
+function renderCardsBoardText(m, events, currentScore) {
+  // events: [{minute, teamName, player, isRed}]
+  const lines = [E.yellow + ' <b>LIVE CARDS UPDATE</b>', ''];
+  lines.push(renderScoreHeader(m, currentScore.home, currentScore.away));
+  lines.push('');
+  lines.push('<b>CARDS:</b>');
+  if (!events.length) {
+    lines.push('<i>none yet</i>');
+  } else {
+    for (const ev of events) {
+      const tName = (ev.teamName || '?').toUpperCase();
+      const icon = ev.isRed ? E.red : E.yellow;
+      lines.push(ev.minute + "' " + icon + ' ' + esc(tName) + ' \u2014 ' + esc(ev.player));
+    }
+  }
+  const lastMin = events.length ? events[events.length - 1].minute : 0;
+  lines.push('');
+  lines.push('<i>LAST UPDATED: ' + lastMin + "'</i>");
+  return lines.join('\n');
+}
+
+function renderSubsBoardText(m, events, currentScore) {
+  // events: [{minute, teamName, playerIn, playerOut}]
+  const lines = [E.swap + ' <b>LIVE SUBSTITUTIONS</b>', ''];
+  lines.push(renderScoreHeader(m, currentScore.home, currentScore.away));
+  lines.push('');
+  lines.push('<b>SUBSTITUTIONS:</b>');
+  lines.push('');
+  if (!events.length) {
+    lines.push('<i>none yet</i>');
+  } else {
+    for (const ev of events) {
+      const tName = (ev.teamName || '?').toUpperCase();
+      lines.push(ev.minute + "' " + esc(tName));
+      lines.push('IN: ' + esc(ev.playerIn));
+      lines.push('OUT: ' + esc(ev.playerOut));
+      lines.push('');
+    }
+  }
+  const lastMin = events.length ? events[events.length - 1].minute : 0;
+  lines.push('<i>LAST UPDATED: ' + lastMin + "'</i>");
+  return lines.join('\n');
+}
+
+// Delete old board message, post fresh one, save new msgId.
+async function rebuildBoard(rec, boardKey, freshText) {
+  const board = rec.boards[boardKey];
+  if (board.msgId) {
+    try { await bot.telegram.deleteMessage(state.groupId, board.msgId); } catch (e) {}
+  }
+  try {
+    const sent = await sendHTML(state.groupId, freshText);
+    board.msgId = sent.message_id;
+    board.messageCounterAtPost = state.groupMessageCounter || 0;
+  } catch (e) {
+    console.log('rebuild board err:', e.message);
+    board.msgId = null;
+  }
+  saveStateNow();
+}
+
 async function checkGoals(m, detail) {
   if (!state.settings.goalAlerts) return;
   const id = String(m.id);
   const rec = state.trackedMatches[id];
-  // never post alerts after match finished
   if (rec.fulltimeSent) return;
-  // initialize tracking
-  if (!rec.announcedScoreStates) rec.announcedScoreStates = {}; // "1-0" -> ts
-  if (!rec.announcedGoalKeys) rec.announcedGoalKeys = []; // scorer|team|minute
+  ensureBoards(rec);
+  if (!rec.eventKeys) rec.eventKeys = {}; // master dedup table for ALL event types
 
   const goals = (detail && detail.goals) || m.goals || [];
-  if (!goals.length) { saveStateNow(); return; }
-  const now = Date.now();
+  if (!goals.length) return;
 
-  // sort goals by minute ascending so we announce in order
+  // sort goals by minute ascending
   const sorted = [...goals].sort((a, b) => (a.minute || 0) - (b.minute || 0));
 
-  // compute running score and announce each NEW goal we haven't seen
   let runHome = 0, runAway = 0;
+  let newEventAdded = false;
   for (const g of sorted) {
     const isHome = g.team && m.homeTeam && (g.team.id === m.homeTeam.id || g.team.name === m.homeTeam.name);
     const isAway = g.team && m.awayTeam && (g.team.id === m.awayTeam.id || g.team.name === m.awayTeam.name);
     if (isHome) runHome += 1;
     else if (isAway) runAway += 1;
 
-    const scoreState = runHome + '-' + runAway;
     const scorer = (g.scorer && g.scorer.name) || 'unknown';
-    const teamKey = (g.team && (g.team.id || g.team.name)) || '?';
-    const goalKey = scorer + '|' + teamKey + '|' + (g.minute || '?');
-
-    // dedup: have we announced THIS scoreline already? skip
-    if (rec.announcedScoreStates[scoreState]) continue;
-    // dedup: same scorer+minute already done? skip
-    if (rec.announcedGoalKeys.indexOf(goalKey) !== -1) continue;
-
-    rec.announcedScoreStates[scoreState] = now;
-    rec.announcedGoalKeys.push(goalKey);
-
-    const apiMin = g.minute;
-    const min = apiMin != null ? Math.min(90, apiMin) + "'" : (liveMinute(m) ? liveMinute(m) + "'" : "?'");
-    let scoringTeam = '';
-    let scoringFlag = '';
-    if (isHome) { scoringTeam = teamName(m.homeTeam); scoringFlag = teamFlag(m.homeTeam); }
-    else if (isAway) { scoringTeam = teamName(m.awayTeam); scoringFlag = teamFlag(m.awayTeam); }
-
-    // Premium presentation: bold caps scorer, team in CAPS
-    // Use the running score we just computed (runHome/runAway) - this is accurate
-    // even if m.score and detail.score haven't caught up yet.
-    const liveScoreLine = (() => {
-      const hf = teamFlag(m.homeTeam), af = teamFlag(m.awayTeam);
-      const hn = (teamName(m.homeTeam) || '?').toUpperCase();
-      const an = (teamName(m.awayTeam) || '?').toUpperCase();
-      return (hf ? hf + ' ' : '') + '<b>' + esc(hn) + '</b>  <b>' + runHome + ' - ' + runAway + '</b>  <b>' + esc(an) + '</b>' + (af ? ' ' + af : '');
-    })();
-    const teamLine = (scoringFlag ? scoringFlag + ' ' : '') + '<i>for ' + esc(scoringTeam.toUpperCase()) + '</i>';
-    const text = E.ball + ' <b>GOAL!</b>\n\n' +
-      '<b>' + esc(scorer.toUpperCase()) + '</b> <i>' + min + '</i>\n' +
-      (scoringTeam ? teamLine + '\n\n' : '\n') +
-      liveScoreLine;
-    try { await sendHTML(state.groupId, text); } catch (e) {}
+    const minute = g.minute != null ? Math.min(120, g.minute) : 0;
+    const teamN = isHome ? teamName(m.homeTeam) : isAway ? teamName(m.awayTeam) : (g.team && g.team.name) || '?';
+    const score = runHome + '-' + runAway;
+    // dedup key
+    const key = id + '|goal|' + minute + '|' + teamN + '|' + scorer + '|' + score;
+    if (rec.eventKeys[key]) continue;
+    rec.eventKeys[key] = 1;
+    rec.boards.goals.events.push({
+      minute, teamName: teamN, scorer, isHome, isAway, score
+    });
+    newEventAdded = true;
   }
-  saveStateNow();
+  // sort the board events too in case API returned out of order
+  rec.boards.goals.events.sort((a, b) => a.minute - b.minute);
+  if (newEventAdded) {
+    const text = renderGoalsBoardText(m, rec.boards.goals.events);
+    await rebuildBoard(rec, 'goals', text);
+  }
 }
+
+// Replaces the old per-event card/sub posting. Maintains card and sub boards.
+async function checkCardsAndSubs(m, detail) {
+  if (!state.settings.goalAlerts) return;
+  if (!detail || !detail._afEvents) return;
+  const id = String(m.id);
+  const rec = state.trackedMatches[id];
+  if (rec.fulltimeSent) return;
+  ensureBoards(rec);
+  if (!rec.eventKeys) rec.eventKeys = {};
+
+  // current score for header (from goals board state)
+  const goalsEv = rec.boards.goals.events;
+  let cs = { home: 0, away: 0 };
+  for (const ev of goalsEv) {
+    if (ev.isHome) cs.home += 1;
+    else if (ev.isAway) cs.away += 1;
+  }
+
+  const events = detail._afEvents;
+  let newCard = false;
+  let newSub = false;
+  for (const ev of events) {
+    const tp = ev.type;
+    if (tp !== 'Card' && tp !== 'subst') continue;
+    const player = (ev.player && ev.player.name) || '?';
+    const team = (ev.team && ev.team.name) || '?';
+    const minute = (ev.time && ev.time.elapsed) || 0;
+    const detail2 = ev.detail || '';
+
+    // figure out side based on team name
+    const tCanon = canonicalTeamName(team);
+    const isHome = canonicalTeamName(teamName(m.homeTeam)) === tCanon;
+    const teamObj = isHome ? m.homeTeam : m.awayTeam;
+    const tName = teamName(teamObj) || team;
+
+    if (tp === 'Card') {
+      const isRed = /red/i.test(detail2);
+      const cardType = isRed ? 'red' : 'yellow';
+      const key = id + '|card|' + minute + '|' + tName + '|' + player + '|' + cardType;
+      if (rec.eventKeys[key]) continue;
+      rec.eventKeys[key] = 1;
+      rec.boards.cards.events.push({ minute, teamName: tName, player, isRed });
+      newCard = true;
+    } else if (tp === 'subst') {
+      // ev.player.name is coming OFF, ev.assist.name is coming ON (per AF docs)
+      const playerOut = player;
+      const playerIn = (ev.assist && ev.assist.name) || '?';
+      const key = id + '|sub|' + minute + '|' + tName + '|' + playerIn + '|' + playerOut;
+      if (rec.eventKeys[key]) continue;
+      rec.eventKeys[key] = 1;
+      rec.boards.subs.events.push({ minute, teamName: tName, playerIn, playerOut });
+      newSub = true;
+    }
+  }
+
+  // sort events
+  rec.boards.cards.events.sort((a, b) => a.minute - b.minute);
+  rec.boards.subs.events.sort((a, b) => a.minute - b.minute);
+
+  if (newCard) {
+    const text = renderCardsBoardText(m, rec.boards.cards.events, cs);
+    await rebuildBoard(rec, 'cards', text);
+  }
+  if (newSub) {
+    const text = renderSubsBoardText(m, rec.boards.subs.events, cs);
+    await rebuildBoard(rec, 'subs', text);
+  }
+}
+
+// Check if community has posted enough since last board update, and re-post if so.
+// Triggered from the polling tick.
+async function maybeRepostBoards() {
+  if (!state.groupId) return;
+  const REPOST_AFTER_MSGS = 5;
+  const counter = state.groupMessageCounter || 0;
+  for (const matchId in state.trackedMatches) {
+    const rec = state.trackedMatches[matchId];
+    if (!rec.boards) continue;
+    if (rec.fulltimeSent) continue;
+    // find the corresponding match object from today cache
+    const matches = todayCache.data || [];
+    const m = matches.find(x => String(x.id) === matchId);
+    if (!m) continue;
+
+    // current score from goals board state
+    const goalsEv = rec.boards.goals.events || [];
+    let cs = { home: 0, away: 0 };
+    for (const ev of goalsEv) {
+      if (ev.isHome) cs.home += 1;
+      else if (ev.isAway) cs.away += 1;
+    }
+
+    for (const key of ['goals', 'cards', 'subs']) {
+      const board = rec.boards[key];
+      if (!board || !board.msgId || !board.events.length) continue;
+      const since = counter - (board.messageCounterAtPost || 0);
+      if (since < REPOST_AFTER_MSGS) continue;
+      // rebuild
+      let text;
+      if (key === 'goals') text = renderGoalsBoardText(m, board.events);
+      else if (key === 'cards') text = renderCardsBoardText(m, board.events, cs);
+      else text = renderSubsBoardText(m, board.events, cs);
+      await rebuildBoard(rec, key, text);
+    }
+  }
+}
+
+
 
 // ---------- Adaptive polling tick ----------
 // Batch is auto-sent to OWNER_ID after each match's winners are queued.
@@ -2798,6 +2974,7 @@ async function autopilotTick() {
     // Auto-repost active prompts if buried
     await maybeRepostVote().catch(e => console.log('repost vote err:', e.message));
     await maybeRepostPrediction().catch(e => console.log('repost pred err:', e.message));
+    await maybeRepostBoards().catch(e => console.log('repost boards err:', e.message));
 
     // full schedule poll every 60s
     if (now - lastFullPoll > 60000) {
@@ -2883,6 +3060,8 @@ bot.on('message', async (ctx, next) => {
     if (ctx.from && ctx.from.id !== cachedBotId) {
       groupMsgCounterSinceVote += 1;
       groupMsgCounterSincePrediction += 1;
+      // global counter for live-board reposts
+      state.groupMessageCounter = (state.groupMessageCounter || 0) + 1;
     }
 
     if (await isAdmin(ctx)) return next();
@@ -3026,7 +3205,7 @@ function buildInstructionsText(botUsername) {
     '',
     '<b>EACH MATCH DAY:</b>',
     '\u2022 ' + VOTE_HOUR_UTC + 'am UTC \u2014 vote on the match',
-    '\u2022 1h before kickoff \u2014 prediction pools open',
+    '\u2022 3h before kickoff \u2014 vote ends, prediction pools open',
     '\u2022 kickoff \u2014 pools close, chat locks',
     '\u2022 full-time \u2014 winners split the pool',
     '',
